@@ -1,0 +1,29 @@
+# ── Go ──
+# 編譯產物（本專案輸出到 bin/，Docker 建置輸出在容器內）
+/bin/
+*.exe
+*.test
+*.out
+
+# 覆蓋率報告
+coverage.out
+coverage.html
+
+# fuzz 語料庫的失敗案例會被 go test 自動寫進這裡；
+# 有價值的案例應該手動搬進 testdata/fuzz/ 並 commit（見 AGENTS.md §4）
+/internal/**/testdata/fuzz/*/[0-9a-f]*
+
+# ── 環境與祕密 ──
+# JWT_SECRET 等祕密一律走環境變數，絕不進 git
+.env
+.env.*
+!.env.example
+
+# ── 工具 / 編輯器 ──
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# ── 壓測與報告的原始輸出（報告本身要 commit，原始檔不用）──
+/test/load/results/
