@@ -41,6 +41,9 @@ const (
 	readHeaderTimeout = 10 * time.Second
 	shutdownTimeout   = 5 * time.Second
 
+	// topicCreateTimeout 是啟動時建立 topic 的時間上限，見 ensureTopics。
+	topicCreateTimeout = 10 * time.Second
+
 	// produceRetryDelay 是寫入 Kafka 失敗後的退避時間。
 	//
 	// compose 啟動時 Kafka 通常比這個程式晚幾秒才準備好，前幾則必然失敗。
@@ -163,6 +166,16 @@ func run() error {
 		}
 	}()
 
+	// 先把 topic 建好再開始發。
+	//
+	// 兩邊的 AllowAutoTopicCreation 其實就夠讓 topic 被建出來，但那是
+	// 「第一次寫入失敗 → 退避 2 秒 → 再試」的路徑，而 consumer 那邊還要
+	// 等 partition watcher（5 秒）偵測到才會 rebalance——冷啟動因此要
+	// 三十秒左右才看得到第一則推播。CI 的煙霧測試就是這樣超時的。
+	//
+	// 明確先建，順便也消掉啟動時那行看起來很像壞掉的 WARN。
+	ensureTopics(ctx, cfg, logger)
+
 	go produceLoop(ctx, cfg, writer, logger)
 
 	httpServer := &http.Server{
@@ -195,6 +208,47 @@ func run() error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	return httpServer.Shutdown(shutdownCtx)
+}
+
+// ensureTopics 建立三個 topic，**best-effort**。
+//
+// # 為什麼失敗只記 WARN 而不讓程序結束
+//
+// 它是「加速器」不是「前提」：writer 帶了 AllowAutoTopicCreation，
+// broker 也開了自動建立，所以就算這一步整個失敗，topic 仍然會在第一次
+// 寫入時被建出來，只是慢個幾十秒。為了一個純粹的最佳化而讓 demo 起不來
+// 是不划算的——尤其在權限受限的 Kafka 上（沒有 CreateTopics 權限）
+// 這一步注定會失敗，但 demo 其實還是能跑。
+//
+// 分區數固定 1：demo 只有一個 consumer，多分區不會更快，
+// 反而會讓「同一個玩家的事件保持順序」這件事需要額外解釋。
+func ensureTopics(ctx context.Context, cfg demoConfig, logger *slog.Logger) {
+	client := &kafka.Client{Addr: kafka.TCP(cfg.Brokers...), Timeout: topicCreateTimeout}
+
+	topics := make([]kafka.TopicConfig, 0, len(allTopics))
+	for _, topic := range allTopics {
+		topics = append(topics, kafka.TopicConfig{
+			Topic:             topic,
+			NumPartitions:     1,
+			ReplicationFactor: 1,
+		})
+	}
+
+	resp, err := client.CreateTopics(ctx, &kafka.CreateTopicsRequest{Topics: topics})
+	if err != nil {
+		logger.Warn("建立 topic 失敗，改由第一次寫入時自動建立", "err", err)
+		return
+	}
+
+	for topic, topicErr := range resp.Errors {
+		// 已經存在不是錯誤——重複啟動 demo 是完全正常的用法。
+		// kafka-go 對 TopicAlreadyExists 回傳的就是這個 error 值，
+		// 所以用 errors.Is 比對而不是去看字串。
+		if topicErr != nil && !errors.Is(topicErr, kafka.TopicAlreadyExists) {
+			logger.Warn("建立 topic 失敗", "topic", topic, "err", topicErr)
+		}
+	}
+	logger.Info("topic 已就緒", "topics", allTopics)
 }
 
 // produceLoop 每隔 EventInterval 發一則假事件，直到 ctx 被取消。

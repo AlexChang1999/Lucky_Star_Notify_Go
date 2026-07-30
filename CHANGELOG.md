@@ -5,6 +5,42 @@
 
 ---
 
+## [fix] — 2026-07-30 — CI 第一次實跑抓到的三件事
+
+CI 在 PR #2 上第一次執行。`建置映像` 過（含映像大小斷言），
+另外兩個 job 掛掉——**兩個都是本機不會出現的問題**，正好是設 CI 的理由。
+
+**Fixed**
+- `TestSlowClientIsDroppedWithoutBlockingOthers` **本機過、CI 掛**。
+  原本的寫法是「主 goroutine 用緊迴圈連發 74 則、另一條 goroutine 讀」，
+  但**正常連線的緩衝同樣只有 64 格**。只要 write goroutine 加上真實
+  WebSocket 的來回追不上那個沒有節流的緊迴圈，正常連線就會被**同一套背壓
+  政策**踢掉，症狀是它自己拿到 1006——看起來像扇出壞了，其實是測試自己
+  造成的。改成廣播與收訊**交錯**（一則一則跟上），在途訊息永遠不超過 1，
+  差別因此是確定性的。順帶把讀取移回主 goroutine：`t.Fatalf` 的語意才正確
+  （從別的 goroutine 呼叫不會真的中止測試，只會讓失敗訊息變成兩份，
+  這次就是這樣），而且整條連線只有一個 reader（`AGENTS.md` §2.17）。
+- 煙霧測試的 `sleep 20` 太短，改成**有上限的輪詢**（90 秒）。
+  冷啟動不只是「等 demo 發第一則」：consumer 還要等 partition watcher
+  （5 秒）偵測到 topic 才會 rebalance（約 3 秒）。固定 sleep 抓太短會假紅，
+  抓太長則每次 CI 都白等。
+
+**Changed**
+- `cmd/demo` 啟動時**先把三個 topic 建好**（`ensureTopics`，best-effort，
+  失敗只記 WARN）。原本靠 `AllowAutoTopicCreation`，走的是
+  「第一次寫入失敗 → 退避 2 秒 → 再試」的路徑。
+  **實測冷啟動到第一則被消費：約 30 秒 → 2.3 秒**，
+  順便消掉啟動時那行看起來很像壞掉的 `寫入 Kafka 失敗` WARN。
+
+**如何驗證**
+- `go test -race -count=5 -run TestSlowClient... ./internal/hub/` 全過；
+  再用 `-cpu=1 -count=3` 跑整個 hub 套件（模擬 CI 的低核心環境）也全過
+- `docker compose down -v` 後重新 up，輪詢實測**第一則被消費 2.3 秒**
+- `gofmt -l` 無輸出、`go vet`、`golangci-lint`（0 issues）、
+  `go test -race ./...` 全綠
+
+---
+
 ## [feat] — 2026-07-30 — Phase 4：容器化、可獨立運行的 demo、觀測性與 CI
 
 **Added**
