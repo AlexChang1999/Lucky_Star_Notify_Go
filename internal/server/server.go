@@ -120,6 +120,16 @@ func New(cfg config.Config, log *slog.Logger, m *metrics.Metrics) *Server {
 	return s
 }
 
+// Hub 回傳連線註冊表，供 Kafka consumer 推播。
+//
+// 為什麼 hub 由 server 持有、而不是 main 建好再傳進來：hub 的生命週期
+// 跟連線綁在一起，而連線是 server 收下來的。main 只需要能拿到它去接
+// consumer——這也是為什麼回傳具體型別而不是包一層介面：介面該由
+// **使用端**定義（見 consumer.Pusher），不是在這裡預先猜。
+func (s *Server) Hub() *hub.Hub {
+	return s.hub
+}
+
 // Handler 回傳整個服務的路由。
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()

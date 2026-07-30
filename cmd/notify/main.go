@@ -13,10 +13,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/AlexChang1999/lucky-star-notify-go/internal/config"
+	"github.com/AlexChang1999/lucky-star-notify-go/internal/consumer"
 	"github.com/AlexChang1999/lucky-star-notify-go/internal/metrics"
 	"github.com/AlexChang1999/lucky-star-notify-go/internal/server"
 )
@@ -69,10 +71,14 @@ func run() error {
 	// signal.NotifyContext 把「收到訊號」變成「context 被 cancel」。
 	//
 	// 這是 Go 的招牌寫法，Java 沒有等價物（那邊要用 @PreDestroy +
-	// SmartLifecycle 拼湊）。好處是同一個 ctx 之後可以一路往下傳給
-	// Kafka consumer（Phase 3），關閉訊號一次通知到所有元件。
+	// SmartLifecycle 拼湊）。好處是同一個 ctx 一路往下傳給 Kafka consumer，
+	// 關閉訊號一次通知到所有元件——這就是計畫書 §5.3「context 貫穿全程」。
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// srv.Hub() 傳進去時會被收窄成 consumer.Pusher（只有兩個方法）。
+	// main 因此完全不必 import hub——介面由使用端定義的好處在這裡具體化了。
+	consumers := startConsumers(ctx, cfg, srv.Hub(), logger, m)
 
 	// 緩衝 1：ListenAndServe 失敗時，即使沒人在 select 這條 channel
 	// 也不會讓那個 goroutine 永久卡在寫入而洩漏。
@@ -104,6 +110,12 @@ func run() error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
+	// 先等 Kafka consumer 收工：它們是訊息來源，停掉之後才不會有新的推播
+	// 灌進正要關閉的連線。正常情況下這只花幾毫秒（FetchMessage 一收到取消
+	// 就返回），但它與底下兩步**共用** shutdownTimeout 的 5 秒預算——
+	// Kafka 掛掉時最壞會吃掉 commit 的那段逾時。
+	waitConsumers(shutdownCtx, consumers, logger)
+
 	// 順序有意義：先讓 HTTP 停止接受新連線並等現有請求做完，
 	// 再收掉 WebSocket。反過來的話，剛關掉的連線可能又有新的接進來。
 	//
@@ -115,4 +127,72 @@ func run() error {
 
 	logger.Info("已停止")
 	return errors.Join(shutdownErr, closeErr)
+}
+
+// startConsumers 為每個 topic 起一條 goroutine，回傳等它們結束用的 WaitGroup。
+//
+// Kafka 沒設定（`KAFKA_BOOTSTRAP_SERVERS=` 明確給空值）時什麼都不起，只印
+// 一行 WARN——服務的 WebSocket 那一半照常可用，適合只想驗推播路徑的本機開發。
+//
+// 這裡收 consumer.Pusher 而不是 *hub.Hub：main 只是把東西接起來，不需要
+// 認識 hub 的其他十幾個方法。
+func startConsumers(
+	ctx context.Context,
+	cfg config.Config,
+	pusher consumer.Pusher,
+	logger *slog.Logger,
+	m *metrics.Metrics,
+) *sync.WaitGroup {
+	var wg sync.WaitGroup
+
+	if !cfg.KafkaEnabled() {
+		logger.Warn("KAFKA_BOOTSTRAP_SERVERS 為空，不啟動 Kafka consumer；" +
+			"此時唯一的訊息來源是 POST /debug/push")
+		return &wg
+	}
+
+	// 不拒絕啟動、只警告：Java 版沒在跑的時候沿用它的 group（接續 offset）
+	// 是合法用法。但兩版同時跑就會互搶 partition，症狀是「Go 版隨機漏訊息」，
+	// 而真因完全看不出來——所以一定要留下這行日誌（AGENTS.md §2.4）。
+	if cfg.KafkaGroupID == config.JavaKafkaGroupID {
+		logger.Warn("consumer group id 與 Java 版相同：兩版同時執行時，"+
+			"每則事件只會進其中一版", "groupID", cfg.KafkaGroupID)
+	}
+
+	logger.Info("啟動 Kafka consumer",
+		"brokers", cfg.KafkaBrokers,
+		"groupID", cfg.KafkaGroupID,
+		"topics", consumer.AllTopics)
+
+	for _, topic := range consumer.AllTopics {
+		c := consumer.New(topic, cfg.KafkaBrokers, cfg.KafkaGroupID, pusher, logger, m)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Run 只在關閉時回傳 nil；回傳錯誤代表是真的壞了，不是關機。
+			if err := c.Run(ctx); err != nil {
+				logger.Error("Kafka consumer 異常結束", "topic", topic, "err", err)
+			}
+		}()
+	}
+	return &wg
+}
+
+// waitConsumers 等 consumer 收工，最多等到 ctx 逾時。
+//
+// WaitGroup.Wait() 沒有帶逾時的版本，所以包一條 goroutine 把它轉成可以
+// select 的 channel——這是 Go 裡把「阻塞呼叫」變成「事件」的標準手法，
+// 值得記住（Java 那邊對應的是 CountDownLatch.await(timeout)）。
+func waitConsumers(ctx context.Context, wg *sync.WaitGroup, logger *slog.Logger) {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+		logger.Warn("等 Kafka consumer 收工逾時，不再等待")
+	}
 }

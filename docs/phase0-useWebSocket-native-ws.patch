@@ -1,0 +1,73 @@
+--- a/frontend/src/hooks/useWebSocket.js
++++ b/frontend/src/hooks/useWebSocket.js
+@@ -24,12 +24,25 @@
+   return Math.min(MAX_RECONNECT_DELAY, INITIAL_RECONNECT_DELAY * 2 ** Math.max(attempt - 1, 0))
+ }
+ 
++// SockJS 的傳輸協商走普通 HTTP 請求（/ws/info），所以要把 ws:// 轉回 http://。
+ function normalizeSockJsUrl(url) {
+   if (url.startsWith('ws://')) return `http://${url.slice(5)}`
+   if (url.startsWith('wss://')) return `https://${url.slice(6)}`
+   return url
+ }
+ 
++// 原生 WebSocket 要的是**相反方向**：http(s):// → ws(s)://，而且必須是絕對 URL。
++//
++// VITE_WS_URL 預設是相對路徑 '/ws'，而瀏覽器對相對路徑 WebSocket 的解析各家行為有差異，
++// 所以一律用 window.location 補上 origin，不要賭。protocol 的判斷要同時認 https: 與 wss:，
++// 否則已經是 wss:// 的網址會被降級成 ws://，在 HTTPS 頁面下會被混合內容政策直接擋掉。
++function toWsUrl(url) {
++  const absolute = new URL(url, window.location.href)
++  absolute.protocol =
++    absolute.protocol === 'https:' || absolute.protocol === 'wss:' ? 'wss:' : 'ws:'
++  return absolute.toString()
++}
++
+ function parseMessageBody(body) {
+   if (!body) return null
+   if (typeof body !== 'string') return body
+@@ -47,7 +60,7 @@
+ }
+ 
+ /**
+- * STOMP over SockJS WebSocket hook.
++ * STOMP over WebSocket hook。傳輸方式由 VITE_WS_TRANSPORT 決定（未設＝SockJS，'native'＝原生 WebSocket）。
+  * Owns the user notification subscription and accepts extra topic subscriptions.
+  *
+  * @param {Object} subscriptions - Map of { destination: handlerFn }
+@@ -68,6 +81,9 @@
+   const useMockApi = import.meta.env.VITE_USE_MOCK_API !== 'false'
+   const useMockWs = import.meta.env.VITE_USE_MOCK_WS === 'true' || useMockApi
+   const enableRealtimeWs = import.meta.env.VITE_ENABLE_WS === 'true'
++  // 'native' 走原生 WebSocket（brokerURL），其餘一律 SockJS。
++  // 預設維持 SockJS：這個改動對現有 demo 是零風險，要切換才需要設環境變數。
++  const wsTransport = import.meta.env.VITE_WS_TRANSPORT === 'native' ? 'native' : 'sockjs'
+ 
+   const clientRef = useRef(null)
+   const reconnectTimerRef = useRef(null)
+@@ -161,8 +177,15 @@
+         reconnectAttemptRef.current
+       )
+ 
++      // 兩種傳輸只差這一個選項：webSocketFactory 是自帶傳輸層（SockJS 的降級協議），
++      // brokerURL 則是讓 stompjs 直接用瀏覽器內建的 WebSocket 連上去。
++      const transportOptions =
++        wsTransport === 'native'
++          ? { brokerURL: toWsUrl(wsUrl) }
++          : { webSocketFactory: () => new SockJS(normalizeSockJsUrl(wsUrl)) }
++
+       const client = new Client({
+-        webSocketFactory: () => new SockJS(normalizeSockJsUrl(wsUrl)),
++        ...transportOptions,
+         connectHeaders: {
+           Authorization: `Bearer ${token}`,
+         },
+@@ -251,7 +274,7 @@
+       }
+       updateStatus(WS_STATUS.DISCONNECTED, 0)
+     }
+-  }, [enableRealtimeWs, handleNotification, token, updateStatus, useMockWs, wsUrl])
++  }, [enableRealtimeWs, handleNotification, token, updateStatus, useMockWs, wsTransport, wsUrl])
+ 
+   return {
+     publish,

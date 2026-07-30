@@ -24,6 +24,26 @@ import (
 // 刻意與 Java 版（8087）錯開：兩版要能同時跑在同一台機器上做 A/B 對照。
 const DefaultPort = 8088
 
+// DefaultKafkaBrokers 是 Kafka bootstrap servers 的預設值。
+//
+// 與 Java 版的 `${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}` 一致。
+// 「沒設定也照樣啟動」本身就是要對齊的行為，不是放寬 fail-fast 原則：
+// Kafka 連不上時 consumer 會退避重試並記 WARN，WebSocket 那一半照常服務。
+const DefaultKafkaBrokers = "localhost:9092"
+
+// DefaultKafkaGroupID 是本服務的 consumer group id。
+//
+// ⚠️ **必須與 Java 版的 notification-service-group 不同。**
+// 用同一個 group，Kafka 會把 partition 分給兩邊，每則事件只進其中一版——
+// 症狀看起來是「Go 版隨機漏訊息」，真因是兩版在搶 partition。這個坑會浪費半天。
+const DefaultKafkaGroupID = "notification-service-go-group"
+
+// JavaKafkaGroupID 是 Java 版使用的 group id。
+//
+// 只用於啟動時比對並印 WARN，**不拒絕啟動**：Java 版沒在跑的時候，
+// 沿用它的 group（接續它的 offset）是完全合法的用法。
+const JavaKafkaGroupID = "notification-service-group"
+
 // MinSecretLen 是 HS256 secret 的最小長度（**bytes，不是字元數**）。
 //
 // 這個數字不是我們發明的，是為了對齊 Java：JJWT 的 Keys.hmacShaKeyFor()
@@ -85,6 +105,19 @@ type Config struct {
 	// 完全沒有訊息來源，連不上任何可以驗收的東西。啟動時會印一行
 	// WARN 提醒，不會靜默地開著。
 	DebugPush bool
+	// KafkaBrokers 是 Kafka 的 bootstrap servers。
+	//
+	// **明確設成空字串**（`KAFKA_BOOTSTRAP_SERVERS=`）代表不啟動 consumer。
+	// 這是給「只想跑 WebSocket 那一半」的本機開發用的逃生門，會印 WARN。
+	// 沒設定則走 DefaultKafkaBrokers，與 Java 版行為一致。
+	KafkaBrokers []string
+	// KafkaGroupID 是 consumer group id，見 DefaultKafkaGroupID 的警告。
+	KafkaGroupID string
+}
+
+// KafkaEnabled 回報是否要啟動 Kafka consumer。
+func (c Config) KafkaEnabled() bool {
+	return len(c.KafkaBrokers) > 0
 }
 
 // FromEnv 從真正的行程環境載入設定。
@@ -102,6 +135,8 @@ func Load(lookup LookupFunc) (Config, error) {
 		AllowedOrigins: []string{"*"},
 		LogLevel:       slog.LevelInfo,
 		DebugPush:      true,
+		KafkaBrokers:   splitAndTrim(DefaultKafkaBrokers),
+		KafkaGroupID:   DefaultKafkaGroupID,
 	}
 
 	// problems 蒐集所有錯誤，最後用 errors.Join 併成一個。
@@ -161,6 +196,23 @@ func Load(lookup LookupFunc) (Config, error) {
 			problems = append(problems, fmt.Errorf("%w：DEBUG_PUSH=%q 不是布林值", ErrInvalidValue, raw))
 		} else {
 			cfg.DebugPush = enabled
+		}
+	}
+
+	// ⚠️ 這裡刻意**不**沿用 ALLOWED_ORIGINS 的「全空就退回預設」規則。
+	// 那邊退回預設是因為「空的白名單」沒有意義；這邊「空的 broker 清單」
+	// 是一個有意義的指令：不要啟動 consumer。把它當成筆誤而退回 localhost，
+	// 反而會讓服務去連一個使用者根本沒打算連的位址。
+	if raw, ok := lookup("KAFKA_BOOTSTRAP_SERVERS"); ok {
+		cfg.KafkaBrokers = splitAndTrim(raw)
+	}
+
+	if raw, ok := lookup("KAFKA_GROUP_ID"); ok {
+		// 只有給了非空白的值才覆寫：空字串當作沒設，避免不小心把
+		// group id 設成 ""——kafka-go 會拿它當「不加入 group」，
+		// 那會變成從 latest 讀但完全不 commit 的怪狀態。
+		if trimmed := strings.TrimSpace(raw); trimmed != "" {
+			cfg.KafkaGroupID = trimmed
 		}
 	}
 

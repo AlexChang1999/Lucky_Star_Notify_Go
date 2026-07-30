@@ -5,6 +5,67 @@
 
 ---
 
+## [feat] — 2026-07-30 — Phase 3：接上 Kafka；補 Phase 0 的前提驗證；補上兩份 ADR
+
+**Added**
+- `internal/consumer`：三個 topic 的消費迴圈，一個 topic 一條 goroutine。
+  - `events.go`：三個事件的 struct **欄位與順序都對齊 Java record**，
+    可空欄位用指標（Java 是包裝型別，缺值要寫成 `null` 而不是 `""` 或 `0`）；
+    `payload` / `entries` 用 `json.RawMessage`（避開 `map[string]any` 的
+    key 重排與 float64 精度損失）
+  - `consumer.go`：`FetchMessage` + `CommitMessages`（手動提交，**不用
+    `ReadMessage`**——那個會自動提交）；`StartOffset: kafka.LastOffset`
+    對齊 `auto-offset-reset: latest`；取訊息失敗退避 2 秒重試
+  - `Pusher` 介面定義在**使用端**，只列 consumer 真的用到的兩個方法
+- 兩個新指標：`notify_kafka_messages_total{topic,result}`（result 分
+  `ok` / `dropped` / `skipped`）、`notify_push_latency_seconds`
+- 兩個新環境變數：`KAFKA_BOOTSTRAP_SERVERS`（預設 `localhost:9092`，
+  **明確給空值＝不啟動 consumer**）、`KAFKA_GROUP_ID`
+  （預設 `notification-service-go-group`）
+- `docs/ADR-001`（為什麼用 Go 重寫，含「多副本連線路由」的未來工作）、
+  `docs/ADR-002`（STOMP 子集取捨 + **RWMutex vs 中央 goroutine 的論證**）
+- `docs/phase0-前端脫離-SockJS.md` 與可 `git apply` 的
+  `docs/phase0-useWebSocket-native-ws.patch`（feature flag
+  `VITE_WS_TRANSPORT=native|sockjs`，**預設維持 SockJS**）
+- 測試：`events_test.go`（19 個案例，逐位元組比對三種 topic 的推播 body）、
+  `consumer_test.go`（壞訊息照樣 commit、退避後繼續、關閉後 goroutine 回基線）、
+  `TestKafkaSettings`、`TestDefaultKafkaGroupDiffersFromJava`
+
+**Changed**
+- `cmd/notify/main.go`：root context 現在一路傳給 Kafka consumer，
+  關閉時**先等 consumer 收工**再收 WebSocket（它們是訊息來源）
+- `server.Server` 多一個 `Hub()` 存取器，讓 main 能把 hub 接給 consumer
+- `.gitattributes`：`*.patch` 設 `-text`
+
+**為什麼**
+- **不論成功與否都 commit offset**：對齊 Java 版的
+  `finally { ack.acknowledge(); }`。壞訊息重試一萬次還是壞的，不 commit 會讓
+  offset 永遠卡在那一則——**一則壞訊息就能讓整個 topic 停擺**。
+- **`commit` 用 `context.WithoutCancel`**：關機時 root ctx 已取消，但剛處理完
+  的那一則還是該提交，否則下次啟動會重播它。
+- **`marshalCompatible` 關掉 HTML 轉義**：`json.Marshal` 預設把 `<` `>` `&`
+  轉成 Unicode 轉義，Jackson 不會。兩者 `JSON.parse` 相同但位元組不同，
+  而本專案主打的正是跨語言等價。（`Encoder.Encode` 會多補一個 `\n`，要砍掉。）
+- **`game.result` 的推播 body 與事件不同形狀**：Java 是另組一個 7 欄物件，
+  `type` 在最前面且**不含 `playerId``**。原樣轉推的話前端拿不到 `type`，
+  會走進「系統通知」分支且無任何錯誤訊息。
+- **group id 預設與 Java 版不同**：同一個 group 會讓兩版互搶 partition，
+  症狀是「Go 版隨機漏訊息」。不拒絕啟動（Java 沒跑時沿用是合法的），只警告。
+
+**如何驗證**
+- `gofmt -l` 無輸出、`go vet ./...` 無輸出、`go build ./...` 通過
+- `go test -race ./...` 全綠（auth / config / consumer / hub / server / stomp）
+- Phase 0 前提：在團隊 repo 跑 `mvn -B test -Dtest=WebSocketStompIntegrationTest`
+  → `Tests run: 3, Failures: 0, Errors: 0` / `BUILD SUCCESS`。
+  該測試用 `StandardWebSocketClient`（**原生 WS、無 SockJS**）連 `/ws`，
+  證明 Go 版不必實作 SockJS 的前提成立。
+- patch 已在乾淨副本上驗過 `git apply --check` 與 round-trip 位元組相同
+- ⚠️ **尚未驗**：用真的 Kafka 灌三種事件、以及真前端登入玩一局的端到端路徑
+  （本機 Docker daemon 未執行）。細節與補做步驟見
+  `docs/phase0-前端脫離-SockJS.md` §3 與 `計畫說明書.md` §6 的 DoD 註記。
+
+---
+
 ## [feat] — 2026-07-30 — Phase 2 完成：Hub、訂閱、扇出、心跳與背壓
 
 **Added**

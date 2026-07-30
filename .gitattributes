@@ -18,3 +18,10 @@ Dockerfile text eol=lf
 *.png binary
 *.jpg binary
 *.gif binary
+
+# patch 檔一律**不要**做行尾轉換。
+#
+# docs/*.patch 是給團隊 repo（Windows checkout，CRLF）套用的，hunk 內容行
+# 帶著 CR。若讓上面的 LF 規則把它正規化掉，git apply 會說 "patch does not
+# apply"——而那個訊息完全指不到「行尾被改了」這個真因。
+*.patch -text

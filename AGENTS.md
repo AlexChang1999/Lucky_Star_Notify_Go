@@ -139,6 +139,32 @@ module path `github.com/AlexChang1999/lucky-star-notify-go`，**Go 1.24+**。
     就是兩個 reader，`-race` 會直接抓到。要嘛只留一個 reader，
     要嘛用不需要回覆的指令（不帶 `receipt`）。
 
+18. **`game.result` 推出去的 body 與事件本身「不同形狀」**：Java 版是另外組一個
+    `LinkedHashMap`——`type` 放**第一個**、而且**不含 `playerId`**（那是路由用的，
+    不是內容）。把事件原樣轉推是最直覺也最容易犯的錯，前端拿不到 `type` 就會
+    走進「系統通知」分支，**而且沒有任何錯誤訊息**。
+    另兩個 topic（`notification.push` / `rank.update`）反而是原事件回吐。
+    三者不一致，動 `internal/consumer/events.go` 前先看那裡的註解。
+
+19. **`json.Marshal` 預設會做 HTML 轉義，Jackson 不會**：`<` `>` `&` 會被換成
+    Unicode 轉義序列。兩邊 `JSON.parse` 之後相同，但位元組不同——本專案主打
+    跨語言等價，所以一律走 `marshalCompatible`（`Encoder` + `SetEscapeHTML(false)`）。
+    ⚠️ `Encoder.Encode` 會在結尾**多補一個 `\n`**，一定要 `TrimSuffix` 砍掉。
+    另一個已知且刻意不處理的差異：Jackson 會把字串 `"42"` **強制轉型**成 `Long`，
+    Go 會直接解析失敗並丟棄。現行 producer 都送數字，所以不值得自訂
+    `UnmarshalJSON`——但有測試把這個差異釘住，別以為是 bug。
+
+20. **消費端不論成功失敗都要 commit offset**：對齊 Java 的
+    `finally { ack.acknowledge(); }`。不 commit 只會讓 offset 卡在壞訊息上，
+    **一則壞訊息就能讓整個 topic 停擺**，而外部看起來只是「推播突然沒了」。
+    另外 `CommitMessages` 要用 `context.WithoutCancel(ctx)` 再加逾時：關機時
+    root ctx 已被取消，直接傳下去會讓最後一則的 offset 提交失敗、下次重播。
+
+21. **`.gitattributes` 的 LF 正規化會把 `*.patch` 弄壞**：`docs/*.patch` 是給
+    團隊 repo（Windows checkout、CRLF）套用的，hunk 內容行帶著 CR。被正規化掉
+    之後 `git apply` 只會說 `patch does not apply`，**完全指不到「行尾被改了」
+    這個真因**。已用 `*.patch -text` 排除。
+
 ---
 
 ## 3. 約定速查
@@ -149,19 +175,25 @@ module path `github.com/AlexChang1999/lucky-star-notify-go`，**Go 1.24+**。
 - **STOMP 協議層＝標準庫自幹**（`internal/stomp`），這是專案價值所在
 - 已引入（Phase 1）：`gorilla/websocket`、`golang-jwt/jwt/v5`、`prometheus/client_golang`、
   `log/slog`（標準庫，**不用第三方 logger**）
-- 還沒引入（Phase 3 才加，不要提前）：`segmentio/kafka-go`（**純 Go，可 `CGO_ENABLED=0` 靜態編譯**）
+- 已引入（Phase 3）：`segmentio/kafka-go`（**純 Go，可 `CGO_ENABLED=0` 靜態編譯**）
 - Port：**8088**（Java 版是 8087，刻意錯開以便併存 A/B）
 - 對外端點：`/ws`（WebSocket）、`/actuator/health`、`/metrics` 與 `/actuator/prometheus`（同一個 handler 註冊兩次，方便接團隊的 Prometheus）、
   `POST /debug/push`（**只在 `DEBUG_PUSH=true` 時註冊**，關掉時是 404 不是 403）
 - 環境變數：`JWT_SECRET`（**必填**，≥ 32 bytes，原始字串不是 base64）、
   `PORT`（預設 8088）、`ALLOWED_ORIGINS`（逗號分隔，預設 `*`）、`LOG_LEVEL`（預設 INFO）、
-  `DEBUG_PUSH`（預設 `true`）。
+  `DEBUG_PUSH`（預設 `true`）、
+  `KAFKA_BOOTSTRAP_SERVERS`（逗號分隔，預設 `localhost:9092`，
+  **明確給空字串＝不啟動 consumer**，適合只想跑 WebSocket 那一半的本機開發）、
+  `KAFKA_GROUP_ID`（預設 `notification-service-go-group`，見地雷 §2.4）。
   缺必填或值不合法**一律拒絕啟動**，且一次回報所有問題（`errors.Join`）。
   ⚠️ `DEBUG_PUSH` 開著的端點**沒有鑑權**，任何連得到本服務的人都能對任意玩家推任意內容。
   預設 `true` 只是因為 Phase 3 之前沒有 Kafka、關掉就沒有訊息來源；
   **接上 Kafka 或任何對外部署都必須設 `false`**。啟動時會印一行 WARN。
 - 自訂指標：`notify_ws_connections`（Gauge）、`notify_outbound_dropped_total`（Counter）。
-  另外兩個（`notify_kafka_messages_total`、`notify_push_latency_seconds`）等 Phase 3 再加。
+  `notify_kafka_messages_total{topic,result}`（Counter，result 分
+  `ok` / `dropped` / `skipped`——**dropped 是上游 bug、skipped 是上游的正常變異，
+  混成一種就看不出差別**）、`notify_push_latency_seconds`（Histogram，
+  量的是「訊息時間戳 → 進 outbound channel」，含 producer 端的時鐘偏移）。
 
 ### 目錄
 `internal/` 底下是實作細節（外部 module 無法 import，比 Java 的 package-private 更硬）。

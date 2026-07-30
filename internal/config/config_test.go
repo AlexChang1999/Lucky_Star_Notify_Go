@@ -184,6 +184,96 @@ func TestLoadReportsAllProblemsAtOnce(t *testing.T) {
 	}
 }
 
+// TestKafkaSettings 檢查 Kafka 設定的預設值與覆寫規則。
+func TestKafkaSettings(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		env         map[string]string
+		wantBrokers []string
+		wantGroup   string
+		wantEnabled bool
+	}{
+		{
+			name:        "沒設就走預設，consumer 會啟動（對齊 Java 的 localhost:9092）",
+			env:         map[string]string{},
+			wantBrokers: []string{"localhost:9092"},
+			wantGroup:   DefaultKafkaGroupID,
+			wantEnabled: true,
+		},
+		{
+			name:        "多個 broker 以逗號分隔，前後空白被清掉",
+			env:         map[string]string{"KAFKA_BOOTSTRAP_SERVERS": " kafka-1:9092 , kafka-2:9092 "},
+			wantBrokers: []string{"kafka-1:9092", "kafka-2:9092"},
+			wantGroup:   DefaultKafkaGroupID,
+			wantEnabled: true,
+		},
+		{
+			// 這裡刻意與 ALLOWED_ORIGINS 的行為不同：那邊「全空」退回預設，
+			// 這邊「明確給空」是一個有意義的指令（不要啟動 consumer）。
+			name:        "明確給空字串＝不啟動 consumer",
+			env:         map[string]string{"KAFKA_BOOTSTRAP_SERVERS": ""},
+			wantBrokers: nil,
+			wantGroup:   DefaultKafkaGroupID,
+			wantEnabled: false,
+		},
+		{
+			name:        "覆寫 group id",
+			env:         map[string]string{"KAFKA_GROUP_ID": "notify-go-experiment"},
+			wantBrokers: []string{"localhost:9092"},
+			wantGroup:   "notify-go-experiment",
+			wantEnabled: true,
+		},
+		{
+			name:        "group id 只給空白＝當作沒設",
+			env:         map[string]string{"KAFKA_GROUP_ID": "   "},
+			wantBrokers: []string{"localhost:9092"},
+			wantGroup:   DefaultKafkaGroupID,
+			wantEnabled: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			env := map[string]string{"JWT_SECRET": validSecret}
+			for k, v := range tt.env {
+				env[k] = v
+			}
+
+			cfg, err := Load(fakeEnv(env))
+			if err != nil {
+				t.Fatalf("Load() 意外失敗：%v", err)
+			}
+
+			if strings.Join(cfg.KafkaBrokers, "|") != strings.Join(tt.wantBrokers, "|") {
+				t.Errorf("KafkaBrokers = %v，預期 %v", cfg.KafkaBrokers, tt.wantBrokers)
+			}
+			if cfg.KafkaGroupID != tt.wantGroup {
+				t.Errorf("KafkaGroupID = %q，預期 %q", cfg.KafkaGroupID, tt.wantGroup)
+			}
+			if cfg.KafkaEnabled() != tt.wantEnabled {
+				t.Errorf("KafkaEnabled() = %v，預期 %v", cfg.KafkaEnabled(), tt.wantEnabled)
+			}
+		})
+	}
+}
+
+// TestDefaultKafkaGroupDiffersFromJava 把 AGENTS.md §2.4 的地雷用測試釘住。
+//
+// 兩版用同一個 group id 時，Kafka 會把 partition 分給兩邊，每則事件只進
+// 其中一版——症狀看起來是「Go 版隨機漏訊息」，真因卻是 group 在搶 partition。
+// 寫在文件裡會被忘記，寫成測試不會。
+func TestDefaultKafkaGroupDiffersFromJava(t *testing.T) {
+	t.Parallel()
+
+	if DefaultKafkaGroupID == JavaKafkaGroupID {
+		t.Fatalf("預設 group id 不可以等於 Java 版的 %q", JavaKafkaGroupID)
+	}
+}
+
 func TestAllowsOrigin(t *testing.T) {
 	t.Parallel()
 
