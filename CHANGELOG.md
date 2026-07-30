@@ -5,6 +5,85 @@
 
 ---
 
+## [feat] — 2026-07-30 — Phase 4：容器化、可獨立運行的 demo、觀測性與 CI
+
+**Added**
+- `Dockerfile`（multi-stage，`ARG CMD` 讓兩個執行檔共用一份）與 `.dockerignore`
+- `cmd/demo`：compose 展示用的**假上游服務**——定期產生三種假事件灌進 Kafka、
+  用 `go:embed` 提供一頁 demo HTML、簽發玩家 token。
+  ⚠️ 簽章能力**只存在於這個執行檔**，正式映像完全不含這段程式碼
+- `cmd/notify` 多一個 `-healthcheck` 旗標：打自己的 `/actuator/health`，
+  正常回 0。給 scratch 映像的容器探針用（映像裡沒有 curl 也沒有 shell）
+- `deploy/docker-compose.yml`：Kafka（單節點 KRaft）+ notify-go + demo，
+  另有 `observability` profile（Prometheus 9091 / Grafana 3001，預設不啟動）
+- `deploy/docker-compose.team.yml`：只起 notify-go，接團隊 repo 的 `lucky-network`
+- `deploy/prometheus.yml`、`deploy/grafana/`（資料來源與 dashboard 都用
+  provisioning 自動載入，不必手動匯入）、`.env.example`
+- `.github/workflows/ci.yml`：gofmt / go vet / golangci-lint / `go test -race` /
+  docker build ×2 / **映像大小上限斷言** / compose 端到端煙霧測試
+- 測試：`cmd/demo` 的 `events_test.go`（逐位元組釘住四條推播路徑的事件形狀）、
+  `token_test.go`（用**服務端真正在用的** `auth.Verifier` 驗簽，
+  而不是自己再解一次——後者是同義反覆）
+
+**Fixed**
+- ⭐ **consumer 比 topic 早啟動就永遠收不到訊息**（Phase 3 遺留的真實缺陷，
+  Phase 4 實測到）。kafka-go 的 `WatchPartitionChanges` 預設 false，
+  加入 group 時 topic 不存在 → 分配到 0 個 partition → 之後**沒有任何事件會
+  觸發 rebalance**。已設 `WatchPartitionChanges: true` + 5 秒的
+  `PartitionWatchInterval`。詳見 `AGENTS.md` §2.23
+
+**Changed**
+- `shutdownTimeout` 5 秒 → **10 秒**，compose 補 `stop_grace_period: 15s`
+- base image 從計畫書原訂的 `gcr.io/distroless/static-debian12` 改成 **`scratch`**
+- demo 頁面在 **8090** 而不是原訂 DoD 寫的 8088
+- Prometheus/Grafana 用 9091/3001 而不是 9090/3000
+
+**為什麼**
+- **base image 改 scratch**：distroless 實測 **23.7 MB**，超過 DoD 的 20 MB。
+  多出來的 5.1 MB 幾乎全是用不到的東西（tzdata 4.24 MB + base-files +
+  media-types + netbase），而本服務不做任何時區換算。改 scratch 後 **18.6 MB**。
+  代價是要自己補回 CA 憑證與**數字 UID**（沒有 /etc/passwd 就不能寫
+  `USER nonroot`，寫了容器直接起不來）。
+- **demo 頁與 token 端點放在獨立容器**：demo 需要發 JWT 才能連上，
+  而把簽章能力放進推播服務，等於在一個對外開埠、沒有帳號系統的服務裡
+  開一個鑑權後門。分成兩個執行檔，正式映像就不可能被誤開。
+  代價是 DoD 原本寫的「打開 localhost:8088」變成 8090。
+- **demo 用 CDN 的 `@stomp/stompjs` 而不是自己手寫 client**：本專案的賣點是
+  伺服器端自己實作 STOMP。連 client 也自己寫的話，證明的只是「我的兩份實作
+  互相相容」，意義接近於零；用業界標準 client 連得上，證明的才是**與規格相容**。
+- **關機預算 5 → 10 秒**：實測慢的不是我們的程式碼。三個 topic 是同一個
+  consumer group 的三個 member，coordinator 一次只處理一個 `LeaveGroup`、
+  每次跑一輪 rebalance，所以是**排隊**離開的，收工恰好每 3.000 秒一個。
+  **選擇等它而不是縮短預算**：不等 LeaveGroup 送完的話，Kafka 要到
+  session timeout（30 秒）才知道我們走了，滾動更新會出現 30 秒的消費空窗，
+  那比關機慢 5 秒糟得多。⚠️ 這個成本隨 topic 數線性成長。
+  （曾懷疑是 kafka-go 的 `HeartbeatInterval`，預設剛好 3 秒；
+  **實測改成 1 秒後間隔仍是 3.000 秒，假設不成立，已還原**。）
+- **觀測性埠往後挪一號**：團隊 repo 的容器占著 9090/3000，同時跑會
+  `port is already allocated`。與服務用 8088（Java 版 8087）是同一個並存理由。
+- **Prometheus/Grafana 預設不啟動**：那兩個映像加起來比整組 demo 還大，
+  而「看推播能不能動」並不需要它們。
+
+**如何驗證**（2026-07-30，在**第二台**沒有團隊 repo 的機器上實測）
+- `gofmt -l` 無輸出、`go vet ./...` 無輸出、`golangci-lint run` 0 issues、
+  `go build ./...` 通過、`go test -race ./...` 全綠（新增 cmd/demo）
+- `docker compose up --build -d --wait` → **39.8 秒**全部 healthy
+  （絕大部分在等 Kafka；notify-go 自己從容器啟動到就緒是 **230 ms**）
+- **端到端**：另寫一支 STOMP over WebSocket client 走完整條路徑
+  （取 token → 握手 → 訂閱 → 收訊息），三條推播路徑
+  （`/user/queue/notifications`、`/topic/notifications`、`/topic/rank`）
+  都收得到，且 `subscription` 與 `message-id` header 都在
+- 映像 **18.6 MB**（`docker images`）／5.29 MB（pull 下載量）；
+  閒置記憶體 **12.9 MiB** / 128 MiB 上限；p95 推播延遲 **4.75 ms**
+- 優雅關閉四輪：牆鐘 **6.5~8.7 秒**，`ExitCode=0`，三個 consumer 都乾淨收工
+- Grafana 的資料來源與 dashboard 自動載入，**dashboard 的 7 條 PromQL
+  逐條對 Prometheus 查過都有資料**（避免指標名稱打錯卻沒人發現）
+- ⚠️ **CI 尚未實際跑過**——workflow 已寫好但要推上 GitHub 才會執行。
+  本機已逐項跑過同樣的指令。這一項 DoD **不打勾**。
+- ⚠️ 瀏覽器端沒有自動化驗證（需要無頭瀏覽器，成本遠高於價值）
+
+---
+
 ## [feat] — 2026-07-30 — Phase 3：接上 Kafka；補 Phase 0 的前提驗證；補上兩份 ADR
 
 **Added**

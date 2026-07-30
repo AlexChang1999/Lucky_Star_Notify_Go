@@ -1,0 +1,25 @@
+# demo 用的 Prometheus 設定（compose 的 observability profile 才會啟動）。
+#
+# 只有一個 target，因為這個環境只有一個要觀測的服務。真實環境的
+# scrape 設定會複雜得多，但那不是這個檔案要示範的東西。
+
+global:
+  # 5 秒。比正式環境常見的 15~30 秒密集，理由是 demo 要「馬上看到圖動」——
+  # 等三十秒才畫出第一個點，看的人會以為壞了。
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: notify-go
+    # ⚠️ 這裡刻意用 /actuator/prometheus 而不是 /metrics。
+    #
+    # 兩個路徑指向同一個 handler（見 internal/server.routes），所以抓哪個
+    # 都一樣。用 actuator 那個是為了與團隊 repo 的 prometheus.yml 一致——
+    # 之後要把 Go 版加進團隊的監控，只要多一個 target，不必另開一個 job。
+    metrics_path: /actuator/prometheus
+    static_configs:
+      # 容器名，不是 localhost：Prometheus 跑在自己的容器裡。
+      - targets: ["notify-go:8088"]
+        labels:
+          service: notification
+          impl: go

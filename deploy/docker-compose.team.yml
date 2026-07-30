@@ -1,0 +1,77 @@
+# 模式 B：把 Go 版接進團隊 repo 已經跑起來的環境（本機驗證 / 錄 demo 用）。
+#
+#   # 1. 先在團隊 repo 那邊把系統起來（它會建立 lucky-network）
+#   # 2. 再從本 repo 起 Go 版：
+#   docker compose -f deploy/docker-compose.team.yml up --build -d
+#
+# 這個檔案**只起 notify-go 一個容器**：Kafka、前端、其他服務全部沿用團隊
+# repo 已經在跑的那一套。所以它跟 docker-compose.yml 是互斥的兩種用法，
+# 不要同時開（兩邊都會搶 8088）。
+#
+# ⚠️ 團隊 repo 對本專案是唯讀參考（AGENTS.md §2.8）：
+# 這裡不會、也不該修改團隊 repo 的任何檔案。要讓整個系統改走 Go 版，
+# 是在**你本機**的團隊 repo `.env` 裡改一行：
+#
+#   NOTIFICATION_SERVICE_URL=http://notify-go:8088
+#
+# 然後 `docker compose up -d gateway-service`。不改 Java 程式碼、不 commit。
+
+name: lucky-star-notify-go-team
+
+services:
+  notify-go:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: lucky-notify-go:latest
+    container_name: notify-go
+    ports:
+      # 8088 而不是 8087：刻意與 Java 版錯開，兩版才能同時跑做 A/B 對照。
+      - "8088:8088"
+    environment:
+      # ⚠️ 必須與團隊 repo 的 member-service 用**同一把** secret，
+      # 否則玩家拿著真實登入拿到的 token 也連不上。
+      # 這裡沒有預設值——接真實環境時忘了設，寧可起不來。
+      JWT_SECRET: ${JWT_SECRET:?請先設定 JWT_SECRET（要與團隊 repo 的 member-service 一致）}
+
+      # 團隊 compose 內部的 Kafka listener。29092 是**容器之間**用的埠，
+      # 9092 那個是給宿主的——填錯會連不上而且訊息只說 broker 不可用。
+      KAFKA_BOOTSTRAP_SERVERS: lucky-star-kafka:29092
+
+      # ⚠️⚠️ 這一行是本檔案最重要的地方（AGENTS.md §2.4）。
+      # 與 Java 版的 notification-service-group **必須不同**。
+      # 用同一個 group，Kafka 會把 partition 分給兩邊，每則事件只進其中
+      # 一版——看起來像「Go 版隨機漏訊息」，實際是兩版在搶 partition。
+      # 這個坑會浪費半天，而且沒有任何錯誤訊息。
+      KAFKA_GROUP_ID: notification-service-go-group
+
+      PORT: "8088"
+      # 接的是真實環境，這個沒有鑑權的端點一定要關掉。
+      DEBUG_PUSH: "false"
+      # 沿用團隊 repo 前端的來源。Java 版是 setAllowedOriginPatterns("*")，
+      # 這裡照樣放寬，才不會在 A/B 對照時多出一個變因。
+      ALLOWED_ORIGINS: "*"
+      GOMEMLIMIT: 100MiB
+    # 必須比服務的 shutdownTimeout（10 秒）長，見 docker-compose.yml 的說明。
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "/app", "-healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          # 對照組：團隊 repo 的 notification-service 是 mem_limit 1280m
+          # 搭 -Xmx1g。十分之一是這個專案最直觀的賣點之一，
+          # 但**數字要實測**（docker stats）才能寫進報告（AGENTS.md §2.7）。
+          memory: 128M
+
+networks:
+  default:
+    # external: true 代表「這個網路已經存在，不要建」。
+    # 團隊 repo 的 compose 先跑起來才會有它；沒跑的話這裡會直接報錯
+    # 說找不到網路——那個錯誤訊息很清楚，是好事。
+    name: lucky-network
+    external: true

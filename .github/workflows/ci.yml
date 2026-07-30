@@ -1,0 +1,167 @@
+# CI：把 AGENTS.md §4 的「提交前自查」搬上來，讓它不依賴我記得跑。
+#
+# 跑在 ubuntu-latest 而不是 windows：Linux 的 Go 自帶 gcc，
+# `-race` 開箱即用。Windows runner 要另外裝 MinGW，而那條路上還有
+# 「安裝路徑不能含空白」之類的坑（AGENTS.md §2.22）——CI 不需要重現
+# 本機環境的問題。
+#
+# ⚠️ **這個檔案從未實際執行過**（要推上 GitHub 才會跑）。第一次推之後
+# 先看 Actions 的結果，特別是下面各個 action 的**主版本號**——那是唯一
+# 沒辦法在本機驗證的部分，寫錯會直接紅在 "Unable to resolve action"。
+# 其餘每一個步驟的指令都已在本機逐項跑過並全綠。
+# 綠燈之後記得回去把 `計畫說明書.md` §6 Phase 4 的第三項 DoD 勾掉。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # 允許手動觸發，方便驗證 workflow 本身的改動。
+  workflow_dispatch:
+
+# 同一個分支連續推送時，取消還在跑的舊 job。省 runner 時間，
+# 而且「最後一次推送的結果」本來就是唯一有意義的那個。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ── 靜態檢查與測試 ──────────────────────────────────────────────
+  test:
+    name: 檢查與測試
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          # 跟著 go.mod 的 go directive 走，不寫死版本號。
+          # 寫死的話升 Go 要改兩個地方，而漏改的那次 CI 會用舊版跑，
+          # 「本機過了 CI 沒過」的來源之一。
+          go-version-file: go.mod
+          # setup-go 內建 module 與 build cache，不必自己設 actions/cache。
+          cache: true
+
+      - name: gofmt
+        # gofmt 不是風格意見，是工具說了算。-l 列出沒對齊的檔案；
+        # 有輸出就讓步驟失敗（gofmt 自己永遠回 0，所以要自己判斷）。
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "以下檔案沒有 gofmt 過："
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12.2
+
+      - name: go test -race
+        # ★ -race 是本專案的硬性要求，不是選配。
+        # 這是併發服務，沒有競態偵測器的測試等於沒測。
+        # （Java 沒有等價工具——這點值得在 README 講。）
+        run: go test -race ./...
+
+  # ── 映像建置 ────────────────────────────────────────────────────
+  # 與測試分開成獨立 job：兩者互不依賴，可以並行，回饋更快。
+  # 而且失敗時一眼看得出是「程式壞了」還是「容器化壞了」。
+  docker:
+    name: 建置映像
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: build notify 映像
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          load: true
+          tags: lucky-notify-go:ci
+          # GitHub Actions 的 layer cache。沒有它，每次 CI 都要重新
+          # 下載全部 Go 依賴再重編一次。
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: build demo 映像
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          load: true
+          build-args: CMD=demo
+          tags: lucky-notify-demo:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 檢查映像大小上限
+        # Phase 4 的 DoD 之一是「映像 < 20 MB」。把它變成 CI 的斷言，
+        # 而不是一次性的截圖——否則哪天有人引入一個肥依賴，
+        # 這個賣點就無聲地失效了。
+        run: |
+          limit=$((20 * 1000 * 1000))
+          size=$(docker image inspect lucky-notify-go:ci --format '{{.Size}}')
+          echo "notify 映像大小：$size bytes（上限 $limit）"
+          if [ "$size" -gt "$limit" ]; then
+            echo "::error::映像超過 20 MB 上限"
+            exit 1
+          fi
+
+  # ── compose 端到端煙霧測試 ──────────────────────────────────────
+  # 「clone + docker compose up 就能看到訊息」是 Phase 4 的第一項 DoD。
+  # 這個 job 把它自動化到「服務起得來、健康檢查過、指標抓得到、
+  # 而且真的消費到了 Kafka 訊息」為止。
+  # 瀏覽器那一段沒有自動化——那需要無頭瀏覽器，成本遠高於價值。
+  smoke:
+    name: compose 煙霧測試
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: 啟動整組服務
+        run: docker compose -f deploy/docker-compose.yml up --build -d --wait
+
+      - name: 健康檢查與指標
+        run: |
+          curl -fsS http://localhost:8088/actuator/health
+          curl -fsS http://localhost:8090/api/config
+          # token 端點要真的簽得出東西來
+          curl -fsS "http://localhost:8090/api/token?playerId=1001" | grep -q '"token"'
+
+      - name: 確認真的消費到 Kafka 訊息
+        # demo 每 3 秒發一則，等 20 秒足夠涵蓋兩輪循環（8 則）。
+        # 斷言的是 result="ok" 的計數 > 0——只看「指標存在」的話，
+        # consumer 完全沒收到訊息也會過。
+        run: |
+          sleep 20
+          metrics=$(curl -fsS http://localhost:8088/actuator/prometheus)
+          echo "$metrics" | grep 'notify_kafka_messages_total' || true
+          ok=$(echo "$metrics" \
+            | awk -F' ' '/^notify_kafka_messages_total\{.*result="ok".*\}/ {sum += $2} END {print sum+0}')
+          echo "result=ok 的訊息數：$ok"
+          # awk 的輸出是浮點數（Prometheus counter 都是），用 cut 取整數部分。
+          if [ "${ok%%.*}" -lt 1 ]; then
+            echo "::error::20 秒內沒有成功消費任何 Kafka 訊息"
+            exit 1
+          fi
+
+      - name: 失敗時印出容器日誌
+        # if: failure() 讓這一步只在前面掛掉時執行。
+        # 沒有它，CI 紅了卻只看得到一句 curl 失敗，查不出原因。
+        if: failure()
+        run: docker compose -f deploy/docker-compose.yml logs --no-color
+
+      - name: 收拾
+        if: always()
+        run: docker compose -f deploy/docker-compose.yml down -v

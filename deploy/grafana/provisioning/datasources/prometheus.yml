@@ -1,0 +1,17 @@
+# 讓 Grafana 啟動時就有資料來源，不必手動點 UI 設定。
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    # uid 要明確指定：dashboard JSON 是用 uid 而不是名稱去綁資料來源的。
+    # 不給的話 Grafana 會隨機產生一個，dashboard 裡寫死的 uid 就對不上，
+    # 每個面板都會顯示 "Datasource not found"。
+    uid: prometheus-notify
+    access: proxy
+    # 容器名。Grafana 是在自己的容器裡向 Prometheus 發請求（access: proxy），
+    # 所以這個位址要在 compose 網路內解析得到，不能寫 localhost。
+    url: http://prometheus:9090
+    isDefault: true
+    # 允許之後用 API 或 UI 改動；demo 環境不需要鎖死。
+    editable: true
