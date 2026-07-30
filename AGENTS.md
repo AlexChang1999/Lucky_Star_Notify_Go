@@ -74,22 +74,63 @@ module path `github.com/AlexChang1999/lucky-star-notify-go`，**Go 1.24+**。
    同機施壓（施壓端與被測服務同一台）會被施壓端自身 CPU 污染，
    **必須在報告裡標明是 co-located，且不可當作對外可引用的容量上限**。
 
-8. **不動團隊 repo**：`H:\Lucky_Star_Casino` 對本專案是**唯讀參考**。
+8. **不動團隊 repo**：團隊 repo 對本專案是**唯讀參考**。
+   實際路徑是 **`D:\Lucky_Star_Casino\Lucky_Star_Casino\`**（注意是**雙層**同名資料夾，
+   `backend/` 在內層）。本檔原本寫 `H:\Lucky_Star_Casino`，那個磁碟機已經不存在了。
    需要驗證行為時可以在本機把它跑起來、可以改本機 `.env`，
    但**不提交任何 commit、不開 PR**。所有產出都留在本資料夾。
+   關鍵檔案索引見 `計畫說明書.md` 附錄 A。
+
+9. **Windows 上 `go test -race` 需要 C compiler**：`-race` 依賴 cgo，錯誤訊息是
+   `go: -race requires cgo; enable cgo by setting CGO_ENABLED=1`——但**設了環境變數也沒用**，
+   真正缺的是 gcc。解法：`winget install BrechtSanders.WinLibs.POSIX.UCRT`，
+   然後把 `...\mingw64\bin` 加進 PATH。裝完 `-race` 就正常。
+   （Linux/容器上不會遇到，所以 CI 沒事，只有本機開發卡住。）
+
+10. **`gorilla/websocket` 的 `CheckOrigin` 預設是「同源才放行」**：
+    不自己設的話，前端跑 `:5173`、服務跑 `:8088` 就是跨源，upgrade 直接回 **403**，
+    而瀏覽器 console 只會說 `WebSocket connection failed`，**指不到真因**。
+    Java 版是 `setAllowedOriginPatterns("*")`，Go 版用 `ALLOWED_ORIGINS` 對齊（預設 `*`）。
+    已處理於 `internal/server.New`。
+
+11. **`http.Server.Shutdown` 不會關閉 WebSocket 連線**：WebSocket 升級是靠 Hijack
+    拿走底層 TCP，而 `Shutdown` 完全不追蹤被 Hijack 的連線——它會「立刻回報完成」，
+    但那些 goroutine 還活著，程序永遠不會結束。**必須自己收**（見 `server.Server.Close`）。
+    而且 Close 那邊**只能 `conn.Close()`，不能 `WriteMessage`**——那是別的 goroutine，
+    會違反第 5 條。要禮貌地先送 STOMP `ERROR` 再關，得等 Phase 2 有 write goroutine 之後。
+
+12. **STOMP over WebSocket 必須用 TextMessage**：送 `websocket.BinaryMessage` 時
+    `@stomp/stompjs` 會**靜默忽略**，沒有錯誤訊息，只有「怎麼沒反應」（同第 3 條的症狀）。
+    `internal/server.writeFrame` 已寫死 TextMessage，測試 `receive()` 也斷言了訊息型別。
+
+13. **心跳沒實作完就不要在 CONNECTED 宣告非零的 `heart-beat`**：
+    若照 client 要求回 `heart-beat:10000,10000` 但伺服器不送心跳，client 等不到就會自己斷線，
+    症狀是「握手明明成功，幾秒後莫名斷線」。Phase 1 一律回 `0,0`（不送也不要求），
+    等 Phase 2 真的實作收發之後才改成協商結果。
+
+14. **Java 版 `PlayerJwtVerifier` 沒有檢查 `type` claim** → member-service 發的
+    **refresh token 也能用來開 WS 連線**。Go 版**刻意照樣不檢查**，否則 Phase 5 的
+    跨語言契約測試會對不上（Go 拒絕了 Java 接受的 token）。
+    這是原版的一個小弱點（refresh token 存活期長很多），不是我們的 bug——
+    要改的話**兩版要一起改**。已有測試把這個行為釘住：
+    `internal/auth` 的「refresh token 也會通過（與 Java 版一致）」。
 
 ---
 
 ## 3. 約定速查
 
 ### 技術棧
-- **Go 1.24+**，module `github.com/AlexChang1999/lucky-star-notify-go`
+- **Go 1.25+**，module `github.com/AlexChang1999/lucky-star-notify-go`
+  （原訂 1.24，被 `prometheus/client_golang` 的 go directive 推上去，見地雷 §2 開頭的說明與 `go.mod` 註解）
 - **STOMP 協議層＝標準庫自幹**（`internal/stomp`），這是專案價值所在
-- 預定依賴（各 Phase 才加，不要提前引入）：
-  `gorilla/websocket`（WS）、`segmentio/kafka-go`（**純 Go，可 `CGO_ENABLED=0` 靜態編譯**）、
-  `golang-jwt/jwt/v5`（JWT）、`prometheus/client_golang`（指標）、`log/slog`（標準庫，**不用第三方 logger**）
+- 已引入（Phase 1）：`gorilla/websocket`、`golang-jwt/jwt/v5`、`prometheus/client_golang`、
+  `log/slog`（標準庫，**不用第三方 logger**）
+- 還沒引入（Phase 3 才加，不要提前）：`segmentio/kafka-go`（**純 Go，可 `CGO_ENABLED=0` 靜態編譯**）
 - Port：**8088**（Java 版是 8087，刻意錯開以便併存 A/B）
 - 對外端點：`/ws`（WebSocket）、`/actuator/health`、`/metrics` 與 `/actuator/prometheus`（同一個 handler 註冊兩次，方便接團隊的 Prometheus）
+- 環境變數：`JWT_SECRET`（**必填**，≥ 32 bytes，原始字串不是 base64）、
+  `PORT`（預設 8088）、`ALLOWED_ORIGINS`（逗號分隔，預設 `*`）、`LOG_LEVEL`（預設 INFO）。
+  缺必填或值不合法**一律拒絕啟動**，且一次回報所有問題（`errors.Join`）。
 
 ### 目錄
 `internal/` 底下是實作細節（外部 module 無法 import，比 Java 的 package-private 更硬）。
@@ -137,7 +178,22 @@ go test -fuzz=FuzzReadFrame -fuzztime=30s ./internal/stomp/
   （Java 沒有等價工具，這點值得在 README 講。）
 - 模糊測試**找到的失敗案例會被自動寫進 `testdata/fuzz/`**——
   有價值的案例要**手動搬進版控**當回歸案例，別讓它被 `.gitignore` 吃掉。
-- `golangci-lint` 安裝：`go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest`
+- `golangci-lint` 安裝（**v2 的路徑多了 `/v2`**，用舊路徑會裝到 v1.64）：
+  `go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest`
+  裝好在 `%USERPROFILE%\go\bin`，記得那個目錄要在 PATH 裡。
+
+**Windows 本機環境**（2026-07-30 實測）：
+- Go 與 gcc 都**不在**預設 PATH，跑指令前要自己補：
+  ```powershell
+  $env:PATH = "C:\Program Files\Go\bin;" +
+    "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin;" +
+    "$env:USERPROFILE\go\bin;$env:PATH"
+  ```
+- gcc 是 `-race` 的前提，見地雷 §2.9。
+- ⚠️ 用 PowerShell 的 `Get-Content` 看含中文的檔案會顯示成亂碼（編碼判斷錯誤），
+  那是**顯示問題不是檔案壞了**。要確認內容請用編輯器或 `Get-Content -Encoding utf8`。
+- ⚠️ 對原生 exe 做 `2>&1` 重導向，PowerShell 5.1 會把 stderr 每一行包成 ErrorRecord
+  並讓 `$?` 變 `$false`，即使程式回 0。跑服務時**不要重導 stderr**。
 
 ---
 
