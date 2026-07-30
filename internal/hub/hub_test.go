@@ -832,30 +832,40 @@ func TestSlowClientIsDroppedWithoutBlockingOthers(t *testing.T) {
 
 	// 廣播的則數要超過緩衝，才會真的觸發丟棄。
 	const rounds = outboundBuffer + 10
-	received := make(chan int, 1)
-	go func() {
-		count := 0
-		for range rounds {
-			frame := healthy.receive(t)
-			if frame.Command == stomp.CommandMessage {
-				count++
-			}
-		}
-		received <- count
-	}()
 
+	// ⚠️ 廣播與收訊必須**交錯**，不可以「先用緊迴圈灌滿、再另開一條
+	// goroutine 讀」。
+	//
+	// 那個寫法本來就是一場競賽，而且會輸：正常連線的緩衝同樣只有
+	// outboundBuffer 格，而 rounds 比它多 10。只要 write goroutine 加上
+	// 真實 WebSocket 的來回追不上那個沒有節流的緊迴圈，**正常連線就會被
+	// 同一套背壓政策踢掉**，症狀是它自己拿到 1006——看起來像扇出壞了，
+	// 其實是測試自己造成的。
+	// 本機（核心多）會過，CI 上掛掉（runner 核心少，又有 t.Parallel()
+	// 的其他測試在搶 CPU）。這是 2026-07-30 CI 第一次執行時抓到的。
+	//
+	// 一則一則跟上之後，正常連線的在途訊息永遠不超過 1，只有慢速連線
+	// 在累積——測試要驗的差別因此是確定性的，不再取決於機器速度。
+	//
+	// 在主 goroutine 讀還有兩個附帶好處：`t.Fatalf` 的語意才正確
+	// （從別的 goroutine 呼叫不會真的中止測試，只會讓失敗訊息變成兩份），
+	// 而且整條連線從頭到尾只有一個 reader（AGENTS.md §2.17）。
+	//
+	// 代價：萬一有人把 enqueue 改成阻塞的，這裡會**卡住**而不是拿到一句
+	// 「收訊逾時」，要等 go test 的逾時（預設 10 分鐘）才會爆。
+	// 換來的是那份 goroutine dump 會直接指著 hub.Broadcast——
+	// 比一句逾時訊息明確得多。
+	messages := 0
 	for i := range rounds {
 		env.hub.Broadcast(testDestination, fmt.Appendf(nil, `{"n":%d}`, i))
+		if frame := healthy.receive(t); frame.Command == stomp.CommandMessage {
+			messages++
+		}
 	}
 
 	// 1. 正常連線一則都沒少。
-	select {
-	case got := <-received:
-		if got != rounds {
-			t.Errorf("正常連線收到 %d 則，預期 %d", got, rounds)
-		}
-	case <-time.After(ioTimeout):
-		t.Fatal("正常連線收訊逾時——扇出很可能被慢速連線卡住了")
+	if messages != rounds {
+		t.Errorf("正常連線收到 %d 則，預期 %d", messages, rounds)
 	}
 
 	// 2. 慢速連線被關掉。

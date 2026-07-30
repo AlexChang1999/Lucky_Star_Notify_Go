@@ -19,6 +19,9 @@ const (
 	topicRankUpdate       = "rank.update"
 )
 
+// allTopics 是這個假上游會寫入的全部 topic，啟動時先建好（見 ensureTopics）。
+var allTopics = []string{topicNotificationPush, topicGameResult, topicRankUpdate}
+
 // eventsPerCycle 是一輪循環包含幾則事件，見 generator.next 的說明。
 const eventsPerCycle = 4
 

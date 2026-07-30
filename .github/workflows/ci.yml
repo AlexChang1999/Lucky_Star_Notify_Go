@@ -140,21 +140,30 @@ jobs:
           curl -fsS "http://localhost:8090/api/token?playerId=1001" | grep -q '"token"'
 
       - name: 確認真的消費到 Kafka 訊息
-        # demo 每 3 秒發一則，等 20 秒足夠涵蓋兩輪循環（8 則）。
         # 斷言的是 result="ok" 的計數 > 0——只看「指標存在」的話，
-        # consumer 完全沒收到訊息也會過。
+        # consumer 完全沒收到訊息也會過（而且那個 CounterVec 從沒被 Inc 過
+        # 時整個不會出現，grep 不到就是一則都沒收到）。
+        #
+        # ⚠️ 用**輪詢加上限**而不是固定 sleep。冷啟動這條路徑不只是
+        # 「等 demo 發第一則」：consumer 還要等 partition watcher（5 秒）
+        # 偵測到 topic 才會 rebalance（約 3 秒）。固定 sleep 20 秒在 CI 上
+        # 就是這樣掛的——時間抓太短，而抓太長又讓每次 CI 都白等。
         run: |
-          sleep 20
-          metrics=$(curl -fsS http://localhost:8088/actuator/prometheus)
-          echo "$metrics" | grep 'notify_kafka_messages_total' || true
-          ok=$(echo "$metrics" \
-            | awk -F' ' '/^notify_kafka_messages_total\{.*result="ok".*\}/ {sum += $2} END {print sum+0}')
-          echo "result=ok 的訊息數：$ok"
-          # awk 的輸出是浮點數（Prometheus counter 都是），用 cut 取整數部分。
-          if [ "${ok%%.*}" -lt 1 ]; then
-            echo "::error::20 秒內沒有成功消費任何 Kafka 訊息"
-            exit 1
-          fi
+          deadline=$((SECONDS + 90))
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            metrics=$(curl -fsS http://localhost:8088/actuator/prometheus || true)
+            ok=$(printf '%s' "$metrics" \
+              | awk '/^notify_kafka_messages_total\{.*result="ok".*\}/ {sum += $2} END {print sum+0}')
+            # awk 印的是浮點數（Prometheus counter 都是），取整數部分再比。
+            if [ "${ok%%.*}" -ge 1 ]; then
+              echo "已消費 $ok 則（等了 ${SECONDS}s）"
+              printf '%s' "$metrics" | grep 'notify_kafka_messages_total'
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::90 秒內沒有成功消費任何 Kafka 訊息"
+          exit 1
 
       - name: 失敗時印出容器日誌
         # if: failure() 讓這一步只在前面掛掉時執行。

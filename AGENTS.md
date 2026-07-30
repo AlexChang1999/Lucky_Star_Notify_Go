@@ -228,6 +228,24 @@ module path `github.com/AlexChang1999/lucky-star-notify-go`，**Go 1.24+**。
     另外 datasource **一定要明寫 `uid`**——dashboard JSON 是用 uid 綁資料來源的，
     不給的話 Grafana 隨機產生，每個面板都會顯示 "Datasource not found"。
 
+27. **背壓測試不能「先灌滿再讀」——正常連線會被自己的測試踢掉**：
+    寫「主 goroutine 用緊迴圈連發 `outboundBuffer + N` 則、另一條 goroutine
+    負責讀」看起來很自然，但**正常連線的緩衝跟慢速連線一樣只有 64 格**。
+    只要 write goroutine 加上真實 WebSocket 的來回追不上那個沒有節流的迴圈，
+    正常連線就會被**同一套背壓政策**踢掉，症狀是它自己收到
+    `close 1006 (abnormal closure)`——**看起來像扇出壞了，其實是測試造成的**。
+    本機（核心多）會過，CI 會掛（runner 核心少，又有 `t.Parallel()` 的其他
+    測試在搶 CPU）。正解是**廣播與收訊交錯**，一則一則跟上：
+    正常連線的在途訊息永遠不超過 1，只有慢速連線在累積，差別因此是確定性的。
+    本機要重現 CI 的條件，用 **`go test -cpu=1`**。
+
+28. **`t.Fatalf` 只能在測試自己那條 goroutine 上呼叫**：從別的 goroutine 呼叫
+    不會中止測試，只會標記失敗然後**繼續往下跑**——於是同一個問題會印出
+    兩份互相矛盾的錯誤訊息（第 27 條那次就是「讀取失敗：1006」加上
+    「收訊逾時，扇出很可能被卡住」，後者其實是前者的後果）。
+    在 goroutine 裡要嘛只用 `t.Errorf` 後 `return`，要嘛把錯誤用 channel
+    送回主 goroutine。最簡單的解法通常是**根本不要開那條 goroutine**。
+
 ---
 
 ## 3. 約定速查
