@@ -40,12 +40,19 @@ func newTestEnv(t *testing.T, origins ...string) *testEnv {
 	if len(origins) == 0 {
 		origins = []string{"*"}
 	}
-	cfg := config.Config{
+	return newTestEnvWithConfig(t, config.Config{
 		Port:           config.DefaultPort,
 		JWTSecret:      []byte(testSecret),
 		AllowedOrigins: origins,
 		LogLevel:       slog.LevelError,
-	}
+	})
+}
+
+// newTestEnvWithConfig 是 newTestEnv 的完整版，用在需要動預設設定的測試
+// （例如打開 DebugPush）。
+func newTestEnvWithConfig(t *testing.T, cfg config.Config) *testEnv {
+	t.Helper()
+
 	m := metrics.New()
 	// 日誌丟掉：測試輸出要乾淨，失敗訊息才看得見。
 	srv := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), m)
@@ -440,6 +447,11 @@ func TestCloseTerminatesLiveConnections(t *testing.T) {
 
 	if err := env.server.Close(); err != nil {
 		t.Fatalf("Close() 失敗：%v", err)
+	}
+	// 關機時會先送一個道別用的 ERROR 帧（見 TestGracefulShutdownSendsErrorFrame），
+	// 先把它讀掉，剩下的才是「連線已關閉」。
+	if frame := receive(t, conn); frame.Command != stomp.CommandError {
+		t.Fatalf("關機時收到 %s，預期 ERROR", frame.Command)
 	}
 	expectClosed(t, conn)
 }

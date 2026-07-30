@@ -96,8 +96,9 @@ module path `github.com/AlexChang1999/lucky-star-notify-go`，**Go 1.24+**。
 11. **`http.Server.Shutdown` 不會關閉 WebSocket 連線**：WebSocket 升級是靠 Hijack
     拿走底層 TCP，而 `Shutdown` 完全不追蹤被 Hijack 的連線——它會「立刻回報完成」，
     但那些 goroutine 還活著，程序永遠不會結束。**必須自己收**（見 `server.Server.Close`）。
-    而且 Close 那邊**只能 `conn.Close()`，不能 `WriteMessage`**——那是別的 goroutine，
-    會違反第 5 條。要禮貌地先送 STOMP `ERROR` 再關，得等 Phase 2 有 write goroutine 之後。
+    Phase 2 起是兩段式：先 `hub.Close` 對已握手的連線送 STOMP `ERROR`（走 outbound
+    channel，所以不違反第 5 條）並等它們寫完，剩下還在握手中的才 `conn.Close()` 硬關。
+    **硬關那一段仍然只能 `conn.Close()`，不能 `WriteMessage`**——那是別的 goroutine。
 
 12. **STOMP over WebSocket 必須用 TextMessage**：送 `websocket.BinaryMessage` 時
     `@stomp/stompjs` 會**靜默忽略**，沒有錯誤訊息，只有「怎麼沒反應」（同第 3 條的症狀）。
@@ -105,8 +106,11 @@ module path `github.com/AlexChang1999/lucky-star-notify-go`，**Go 1.24+**。
 
 13. **心跳沒實作完就不要在 CONNECTED 宣告非零的 `heart-beat`**：
     若照 client 要求回 `heart-beat:10000,10000` 但伺服器不送心跳，client 等不到就會自己斷線，
-    症狀是「握手明明成功，幾秒後莫名斷線」。Phase 1 一律回 `0,0`（不送也不要求），
-    等 Phase 2 真的實作收發之後才改成協商結果。
+    症狀是「握手明明成功，幾秒後莫名斷線」。Phase 1 一律回 `0,0`；Phase 2 實作了收發之後
+    才改成宣告 `10000,10000`。**改動 `server.serverHeartbeatSend` 前先確認
+    `hub.Session.writeLoop` 的 ticker 還在送**——這兩處必須成對，拆開就是上面那個 bug。
+    另外，協商公式是**取 max 不是 min**（`server→client = max(cy, sx)`），
+    所以 client 要求更快的間隔是沒用的；照著 min 寫會宣告出做不到的頻率。
 
 14. **Java 版 `PlayerJwtVerifier` 沒有檢查 `type` claim** → member-service 發的
     **refresh token 也能用來開 WS 連線**。Go 版**刻意照樣不檢查**，否則 Phase 5 的
@@ -114,6 +118,26 @@ module path `github.com/AlexChang1999/lucky-star-notify-go`，**Go 1.24+**。
     這是原版的一個小弱點（refresh token 存活期長很多），不是我們的 bug——
     要改的話**兩版要一起改**。已有測試把這個行為釘住：
     `internal/auth` 的「refresh token 也會通過（與 Java 版一致）」。
+
+15. **握手回覆不能由 HTTP handler 直接寫出去**（Phase 2 踩到的真 bug）：
+    原本流程是 `writeFrame(CONNECTED)` → `hub.Serve()`，於是「client 收到 CONNECTED」
+    **早於**「session 登記進 hub」。中間那段空窗期裡，廣播與關機通知都會漏掉這條連線，
+    而且**沒有任何錯誤訊息**——只會偶發地「某個剛連上的人沒收到」。
+    正解是把 CONNECTED 交給 `SessionConfig.Greeting`，順序變成 `h.add` → enqueue，
+    write goroutine 才送出。附帶好處：整條連線從頭到尾只有一個 writer，不再有特例要論證。
+    **任何「先回覆、後註冊」的寫法都要用同樣的眼光檢查一次。**
+
+16. **`time.After` 不能放在迴圈裡當共用逾時**：它回傳的 channel 只會收到**一次**值。
+    在 `for { select { case <-ch: ...; case <-time.After(...) } }` 之外先算好一個
+    `deadline := time.After(t)` 然後在迴圈裡 select 它 —— 第一個逾時的項目就把訊號吃掉，
+    後面每一個都退化成**無上限等待**。用 `context.WithTimeout` 的 `ctx.Done()`：
+    它關閉之後永遠可讀。`hub.Close` 就是這樣寫的。
+
+17. **測試碼一樣受「一個 reader / 一個 writer」限制**：第 5 條講的是伺服器端，
+    但 client 端的 `*websocket.Conn` 同樣如此。在測試裡「開一條 goroutine 一直
+    `ReadMessage`」＋「主 goroutine 呼叫會讀取的 helper（例如等 RECEIPT）」
+    就是兩個 reader，`-race` 會直接抓到。要嘛只留一個 reader，
+    要嘛用不需要回覆的指令（不帶 `receipt`）。
 
 ---
 
@@ -127,10 +151,17 @@ module path `github.com/AlexChang1999/lucky-star-notify-go`，**Go 1.24+**。
   `log/slog`（標準庫，**不用第三方 logger**）
 - 還沒引入（Phase 3 才加，不要提前）：`segmentio/kafka-go`（**純 Go，可 `CGO_ENABLED=0` 靜態編譯**）
 - Port：**8088**（Java 版是 8087，刻意錯開以便併存 A/B）
-- 對外端點：`/ws`（WebSocket）、`/actuator/health`、`/metrics` 與 `/actuator/prometheus`（同一個 handler 註冊兩次，方便接團隊的 Prometheus）
+- 對外端點：`/ws`（WebSocket）、`/actuator/health`、`/metrics` 與 `/actuator/prometheus`（同一個 handler 註冊兩次，方便接團隊的 Prometheus）、
+  `POST /debug/push`（**只在 `DEBUG_PUSH=true` 時註冊**，關掉時是 404 不是 403）
 - 環境變數：`JWT_SECRET`（**必填**，≥ 32 bytes，原始字串不是 base64）、
-  `PORT`（預設 8088）、`ALLOWED_ORIGINS`（逗號分隔，預設 `*`）、`LOG_LEVEL`（預設 INFO）。
+  `PORT`（預設 8088）、`ALLOWED_ORIGINS`（逗號分隔，預設 `*`）、`LOG_LEVEL`（預設 INFO）、
+  `DEBUG_PUSH`（預設 `true`）。
   缺必填或值不合法**一律拒絕啟動**，且一次回報所有問題（`errors.Join`）。
+  ⚠️ `DEBUG_PUSH` 開著的端點**沒有鑑權**，任何連得到本服務的人都能對任意玩家推任意內容。
+  預設 `true` 只是因為 Phase 3 之前沒有 Kafka、關掉就沒有訊息來源；
+  **接上 Kafka 或任何對外部署都必須設 `false`**。啟動時會印一行 WARN。
+- 自訂指標：`notify_ws_connections`（Gauge）、`notify_outbound_dropped_total`（Counter）。
+  另外兩個（`notify_kafka_messages_total`、`notify_push_latency_seconds`）等 Phase 3 再加。
 
 ### 目錄
 `internal/` 底下是實作細節（外部 module 無法 import，比 Java 的 package-private 更硬）。
@@ -188,6 +219,12 @@ go test -fuzz=FuzzReadFrame -fuzztime=30s ./internal/stomp/
   $env:PATH = "C:\Program Files\Go\bin;" +
     "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin;" +
     "$env:USERPROFILE\go\bin;$env:PATH"
+  ```
+  在 **Git Bash** 裡不能直接沿用上面那串：`$LOCALAPPDATA` 展開出來是含反斜線的
+  `C:\Users\...`，塞進 bash 的 `PATH` 會找不到 gcc，錯誤訊息還是那句
+  `-race requires cgo`（指不到真因，見地雷 §2.9）。要用全正斜線的形式：
+  ```bash
+  export PATH="/c/Program Files/Go/bin:/c/Users/User/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/bin:/c/Users/User/go/bin:$PATH"
   ```
 - gcc 是 `-race` 的前提，見地雷 §2.9。
 - ⚠️ 用 PowerShell 的 `Get-Content` 看含中文的檔案會顯示成亂碼（編碼判斷錯誤），

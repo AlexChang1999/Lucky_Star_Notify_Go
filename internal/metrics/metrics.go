@@ -36,6 +36,16 @@ type Metrics struct {
 	// 用 Gauge 而不是 Counter：它會上下浮動。Counter 只能遞增，
 	// 拿來數「當前數量」是常見的新手錯誤。
 	WSConnections prometheus.Gauge
+
+	// OutboundDropped 是因為 outbound channel 塞滿而被踢掉的連線數。
+	//
+	// 這是**背壓策略的可觀測性出口**：扇出時絕不阻塞，慢速客戶端一律
+	// fail-fast 斷線（AGENTS.md §2.6）。沒有這個計數器的話，「被踢掉」
+	// 這件事在外部完全看不見——只會表現成使用者那端莫名重連。
+	//
+	// 用 Counter 而不是 Gauge：它只會遞增，而且真正有意義的是
+	// rate()（每秒被踢幾條），不是當下的絕對值。
+	OutboundDropped prometheus.Counter
 }
 
 // New 建立指標集合並註冊 collector。
@@ -57,8 +67,13 @@ func New() *Metrics {
 			Name:      "ws_connections",
 			Help:      "目前建立中的 WebSocket 連線數",
 		}),
+		OutboundDropped: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "outbound_dropped_total",
+			Help:      "因送出佇列塞滿而被斷線的慢速客戶端次數",
+		}),
 	}
-	registry.MustRegister(m.WSConnections)
+	registry.MustRegister(m.WSConnections, m.OutboundDropped)
 	return m
 }
 

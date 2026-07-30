@@ -2,7 +2,9 @@ package server
 
 import (
 	"errors"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/AlexChang1999/lucky-star-notify-go/internal/auth"
 	"github.com/AlexChang1999/lucky-star-notify-go/internal/stomp"
@@ -19,6 +21,33 @@ const StompVersion = "1.2"
 // 規格說 SHOULD 帶，格式是 name/version。除錯時能一眼看出對面是哪一版。
 const serverHeaderValue = "lucky-star-notify-go/0.1.0"
 
+// 伺服器對心跳的**自我宣告**（規格 §heart-beating 的 <sx>,<sy>）。
+//
+//   - serverHeartbeatSend（sx）＝「我最快能每 N 毫秒送一次」
+//   - serverHeartbeatWant（sy）＝「我希望你每 N 毫秒送一次」
+//
+// 10 秒是對齊 @stomp/stompjs 的預設值（10000/10000），談出來的結果就會是
+// 雙向各 10 秒，不會因為兩邊期望不同而變成奇怪的間隔。
+//
+// ⚠️ 這兩個值宣告出去就**必須**做到：宣告了非零的 sx 卻不送心跳，
+// client 等不到就會自己斷線，症狀是「握手成功、幾秒後莫名斷線」（AGENTS.md §2.13）。
+// 真正在送的是 hub.Session 的 write goroutine——改動這裡之前先確認那邊還在送。
+const (
+	serverHeartbeatSend = 10 * time.Second
+	serverHeartbeatWant = 10 * time.Second
+)
+
+// heartbeat 是協商後的結果，單位是實際的時間間隔。
+//
+// 零值代表「該方向不啟用」——規格用 0 表達這件事，Go 這邊剛好
+// time.Duration(0) 同義，不必另外用 bool 標記。
+type heartbeat struct {
+	// Send 是伺服器要送心跳給 client 的間隔；0 = 不送。
+	Send time.Duration
+	// Recv 是伺服器期待 client 送心跳過來的間隔；0 = 不要求（讀取不設逾時）。
+	Recv time.Duration
+}
+
 // handshakeResult 是握手的結論。
 //
 // 不論成功或失敗都有 Reply（CONNECTED 或 ERROR），呼叫端只要「送出 Reply，
@@ -29,6 +58,8 @@ type handshakeResult struct {
 	PlayerID string
 	// Reply 是要送回 client 的帧。
 	Reply *stomp.Frame
+	// Heartbeat 是協商後的雙向心跳間隔；握手失敗時為零值。
+	Heartbeat heartbeat
 	// OK 為 true 表示握手成功，連線可以繼續。
 	OK bool
 }
@@ -78,25 +109,81 @@ func handshake(verifier *auth.Verifier, frame *stomp.Frame, sessionID string) ha
 	}
 
 	return handshakeResult{
-		PlayerID: playerID,
-		OK:       true,
+		PlayerID:  playerID,
+		OK:        true,
+		Heartbeat: negotiateHeartbeat(frame.Headers.Get(stomp.HeaderHeartBeat)),
 		Reply: &stomp.Frame{
 			Command: stomp.CommandConnected,
 			Headers: stomp.Headers{
 				{Name: stomp.HeaderVersion, Value: StompVersion},
 				{Name: "session", Value: sessionID},
 				{Name: "server", Value: serverHeaderValue},
-				// heart-beat:0,0 = 「我不送心跳，也不要求你送」。
-				//
-				// Phase 1 刻意這樣宣告，因為心跳的收發還沒實作。
-				// 如果這裡照著 client 的要求回一個非零值，client 會在
-				// 等不到心跳時主動斷線——那是一個「握手看起來成功、
-				// 幾秒後莫名斷線」的 bug，比誠實回 0,0 難查太多。
-				// Phase 2 實作心跳後才改成真正的協商結果。
-				{Name: stomp.HeaderHeartBeat, Value: "0,0"},
+				// CONNECTED 帶的是**伺服器自己的** sx,sy，不是協商結果。
+				// 協商是兩邊各自用同一個公式算出來的（見 negotiateHeartbeat），
+				// 規格沒有「把結果告訴對方」這一步。
+				{Name: stomp.HeaderHeartBeat, Value: serverHeartbeatHeader()},
 			},
 		},
 	}
+}
+
+// serverHeartbeatHeader 產生 CONNECTED 用的 "sx,sy" 字串。
+func serverHeartbeatHeader() string {
+	return strconv.FormatInt(serverHeartbeatSend.Milliseconds(), 10) + "," +
+		strconv.FormatInt(serverHeartbeatWant.Milliseconds(), 10)
+}
+
+// negotiateHeartbeat 依規格算出雙向的實際心跳間隔。
+//
+// client 在 CONNECT 送 "cx,cy"：
+//
+//   - cx = client 保證最快能送的間隔（client → server）
+//   - cy = client 希望收到的間隔（server → client）
+//
+// 規格的公式是「任一邊為 0 就關掉該方向，否則取兩者較大值」：
+//
+//	server → client： cy==0 || sx==0 ? 0 : max(cy, sx)
+//	client → server： cx==0 || sy==0 ? 0 : max(cx, sy)
+//
+// 取 max 而不是 min 的理由值得記住：兩個數字的語意不同（一邊是「我最快
+// 只能這麼快」、一邊是「我希望這麼頻繁」），能同時滿足雙方的只有較大值。
+//
+// header 缺漏或格式不正確時一律當成 "0,0"（＝不啟用）。規格把格式錯誤
+// 算成協議錯誤，但這裡選擇寬容：斷線的代價遠大於少一組心跳，而且
+// 「談不成心跳」本身不會造成任何不一致。
+func negotiateHeartbeat(header string) heartbeat {
+	cx, cy, ok := parseHeartbeatHeader(header)
+	if !ok {
+		return heartbeat{}
+	}
+	return heartbeat{
+		Send: pickInterval(cy, serverHeartbeatSend),
+		Recv: pickInterval(cx, serverHeartbeatWant),
+	}
+}
+
+// pickInterval 實作規格的 "0 → 關閉，否則取 max" 規則。
+func pickInterval(theirs, ours time.Duration) time.Duration {
+	if theirs <= 0 || ours <= 0 {
+		return 0
+	}
+	return max(theirs, ours)
+}
+
+// parseHeartbeatHeader 解析 "cx,cy"，值的單位是毫秒。
+//
+// ok 為 false 代表格式不合（缺逗號、不是數字、負數），呼叫端當成 0,0 處理。
+func parseHeartbeatHeader(header string) (cx, cy time.Duration, ok bool) {
+	rawX, rawY, found := strings.Cut(header, ",")
+	if !found {
+		return 0, 0, false
+	}
+	msX, errX := strconv.Atoi(strings.TrimSpace(rawX))
+	msY, errY := strconv.Atoi(strings.TrimSpace(rawY))
+	if errX != nil || errY != nil || msX < 0 || msY < 0 {
+		return 0, 0, false
+	}
+	return time.Duration(msX) * time.Millisecond, time.Duration(msY) * time.Millisecond, true
 }
 
 // acceptsVersion 回報 client 的 accept-version 清單是否包含 want。
@@ -113,23 +200,10 @@ func acceptsVersion(header, want string) bool {
 	return false
 }
 
-// errorFrame 組出一個 ERROR 帧。
+// errorFrame 是 stomp.ErrorFrame 的套件內短名。
 //
-// message header 放**簡短、給機器看**的原因；body 放給人看的細節。
-// 規格建議 ERROR 帶 body 說明，而 @stomp/stompjs 會把 message header
-// 丟進 onStompError 的 callback，前端能直接顯示。
-//
-// 注意 ERROR **不在**免轉義的例外清單裡（只有 CONNECT/CONNECTED 是），
-// 所以 message 裡若含冒號會被 Marshal 自動轉成 \c——這是對的，不必自己處理。
+// 本檔與 server.go 用它的次數夠多，留一個薄包裝比每處寫全名好讀；
+// 實作在 stomp 是因為 hub 也要組 ERROR 帧（見 stomp.ErrorFrame 的說明）。
 func errorFrame(message, detail string, extra ...stomp.Header) *stomp.Frame {
-	headers := stomp.Headers{
-		{Name: stomp.HeaderMessage, Value: message},
-		{Name: stomp.HeaderContentType, Value: "text/plain;charset=UTF-8"},
-	}
-	headers = append(headers, extra...)
-	return &stomp.Frame{
-		Command: stomp.CommandError,
-		Headers: headers,
-		Body:    []byte(detail),
-	}
+	return stomp.ErrorFrame(message, detail, extra...)
 }

@@ -278,3 +278,27 @@ func (f *Frame) Marshal() []byte {
 func (f *Frame) String() string {
 	return strings.ReplaceAll(string(f.Marshal()), "\x00", "^@")
 }
+
+// ErrorFrame 組出一個 ERROR 帧。
+//
+// message header 放**簡短、給機器看**的原因；body 放給人看的細節。
+// 規格建議 ERROR 帶 body 說明，而 @stomp/stompjs 會把 message header
+// 丟進 onStompError 的 callback，前端能直接顯示。
+//
+// 注意 ERROR **不在**免轉義的例外清單裡（只有 CONNECT/CONNECTED 是），
+// 所以 message 裡若含冒號會被 Marshal 自動轉成 \c——這是對的，不必自己處理。
+//
+// 放在 stomp 而不是各自的呼叫端，是因為 server（握手失敗）與 hub
+// （連線建立後的協議錯誤、關機通知）都要用；ERROR 帧的形狀是協議層的事。
+func ErrorFrame(message, detail string, extra ...Header) *Frame {
+	headers := Headers{
+		{Name: HeaderMessage, Value: message},
+		{Name: HeaderContentType, Value: "text/plain;charset=UTF-8"},
+	}
+	headers = append(headers, extra...)
+	return &Frame{
+		Command: CommandError,
+		Headers: headers,
+		Body:    []byte(detail),
+	}
+}

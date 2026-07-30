@@ -212,3 +212,56 @@ func TestAllowsOrigin(t *testing.T) {
 		})
 	}
 }
+
+// TestDebugPush 檢查除錯推播端點的旗標。
+//
+// 預設 true 是刻意的：Phase 3 接上 Kafka 之前，關掉它服務就沒有任何
+// 訊息來源。但它**沒有鑑權**，正式部署必須明確設成 false。
+func TestDebugPush(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		raw     string
+		set     bool
+		want    bool
+		wantErr bool
+	}{
+		{name: "沒設時預設開啟", want: true},
+		{name: "空字串當作沒設", raw: "", set: true, want: true},
+		{name: "false 關閉", raw: "false", set: true, want: false},
+		{name: "0 也算關閉", raw: "0", set: true, want: false},
+		{name: "1 算開啟", raw: "1", set: true, want: true},
+		{name: "TRUE 算開啟", raw: "TRUE", set: true, want: true},
+		{name: "認不出來就拒絕啟動", raw: "yes", set: true, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg, err := Load(func(key string) (string, bool) {
+				switch key {
+				case "JWT_SECRET":
+					return strings.Repeat("k", MinSecretLen), true
+				case "DEBUG_PUSH":
+					return tt.raw, tt.set
+				}
+				return "", false
+			})
+
+			if tt.wantErr {
+				if !errors.Is(err, ErrInvalidValue) {
+					t.Fatalf("錯誤 = %v，預期 ErrInvalidValue", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("預期成功，卻失敗：%v", err)
+			}
+			if cfg.DebugPush != tt.want {
+				t.Errorf("DebugPush = %v，預期 %v", cfg.DebugPush, tt.want)
+			}
+		})
+	}
+}

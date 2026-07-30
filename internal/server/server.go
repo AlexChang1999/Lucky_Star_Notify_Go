@@ -5,12 +5,15 @@
 //	GET /metrics              Prometheus 指標
 //	GET /actuator/prometheus  同上，路徑對齊團隊 repo 的 prometheus.yml
 //
-// # Phase 1 的範圍
+// 另外，DEBUG_PUSH 開啟時多一個：
 //
-// 這一階段只做到「握手成功／失敗」。CONNECTED 之後收到的帧會被讀掉丟棄，
-// 訂閱與推播是 Phase 2（internal/hub）的事。連線目前是**單一 goroutine**
-// （只有讀），所以寫入只發生在握手回覆那一次；Phase 2 導入 outbound channel
-// 與獨立的 write goroutine 之後，就必須遵守「一條連線只有一個 writer」的規則。
+//	POST /debug/push          手動灌一則訊息（無鑑權，正式環境務必關閉）
+//
+// # 職責邊界
+//
+// 這個套件只負責「路由」與「握手」。握手成功之後整條連線就交給
+// internal/hub 的 Session 接管——訂閱、推播、心跳、收尾都在那邊。
+// 這樣切是為了讓 hub 完全不認識 HTTP，Phase 3 接 Kafka 時不必動它。
 package server
 
 import (
@@ -23,6 +26,7 @@ import (
 
 	"github.com/AlexChang1999/lucky-star-notify-go/internal/auth"
 	"github.com/AlexChang1999/lucky-star-notify-go/internal/config"
+	"github.com/AlexChang1999/lucky-star-notify-go/internal/hub"
 	"github.com/AlexChang1999/lucky-star-notify-go/internal/metrics"
 	"github.com/AlexChang1999/lucky-star-notify-go/internal/stomp"
 	"github.com/gorilla/websocket"
@@ -39,6 +43,12 @@ const (
 	// writeTimeout 是單次寫出的上限。對方 TCP 視窗塞住時，
 	// 沒有 deadline 的寫入會無限期阻塞。
 	writeTimeout = 10 * time.Second
+
+	// shutdownGrace 是關機時，等所有連線收到 ERROR 帧並乾淨關閉的上限。
+	//
+	// 3 秒是從 main 的 5 秒總預算裡切出來的：留 2 秒給 http.Server.Shutdown
+	// 處理一般 HTTP 請求。超過就硬關——關不掉比慢一點更糟。
+	shutdownGrace = 3 * time.Second
 )
 
 // maxMessageSize 是單一 WebSocket 訊息的上限。
@@ -65,12 +75,15 @@ type Server struct {
 	metrics  *metrics.Metrics
 	log      *slog.Logger
 	upgrader websocket.Upgrader
+	hub      *hub.Hub
 
 	// mu 保護 conns 與 closed。
 	//
-	// Phase 1 用最單純的 Mutex 就好：這裡只有「連線建立/斷開」兩種寫入，
-	// 沒有高頻讀取。Phase 2 的 hub 才需要 RWMutex（廣播是高頻讀）。
-	// 不要因為「以後會需要」就先用 RWMutex——那是提前最佳化。
+	// 這裡用最單純的 Mutex 就好：只有「連線建立/斷開」兩種寫入，沒有
+	// 高頻讀取。真正需要 RWMutex 的是 hub 的註冊表（廣播是高頻讀）。
+	//
+	// conns 追蹤的是**所有升級成功的連線**，包含還在握手、還沒交給 hub 的那些。
+	// 那段空窗期 hub 不認識它們，關機時就只能靠這份清單把它們收掉。
 	mu     sync.Mutex
 	conns  map[*websocket.Conn]struct{}
 	closed bool
@@ -83,6 +96,7 @@ func New(cfg config.Config, log *slog.Logger, m *metrics.Metrics) *Server {
 		verifier: auth.NewVerifier(cfg.JWTSecret),
 		metrics:  m,
 		log:      log,
+		hub:      hub.New(log, m),
 		conns:    make(map[*websocket.Conn]struct{}),
 	}
 	s.upgrader = websocket.Upgrader{
@@ -123,6 +137,13 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /metrics", metricsHandler)
 	mux.Handle("GET /actuator/prometheus", metricsHandler)
 
+	// 只在旗標打開時才註冊——關掉時是「這個路徑不存在（404）」，
+	// 而不是「存在但回 403」。少洩漏一個資訊給掃描器。
+	if s.cfg.DebugPush {
+		s.log.Warn("POST /debug/push 已啟用：這個端點沒有鑑權，正式環境請設 DEBUG_PUSH=false")
+		mux.HandleFunc("POST /debug/push", s.handleDebugPush)
+	}
+
 	return mux
 }
 
@@ -134,14 +155,17 @@ func (s *Server) Handler() http.Handler {
 // 正是靠 Hijack 拿走底層 TCP 連線。所以 Shutdown 會「立刻回報完成」，
 // 而那些 WebSocket goroutine 還活著。優雅關閉必須自己收這一段。
 //
-// # 為什麼只 Close 而不先送 STOMP ERROR
+// # 兩段式關閉
 //
-// gorilla 的連線同時只允許一個 writer。這裡是 main 的 goroutine，
-// 而連線自己的 goroutine 正在 ReadMessage——若在這裡呼叫 WriteMessage，
-// 就是兩個 goroutine 寫同一條連線（AGENTS.md §2.5）。
-// conn.Close() 併發呼叫是 gorilla 明確支援的做法，也是喚醒阻塞中 reader
-// 的標準手段。Phase 2 有了 write goroutine 與 outbound channel 之後，
-// 才有辦法「先禮貌地送 ERROR 再關」。
+//  1. hub.Close：對**已握手**的連線送 STOMP ERROR 帧，等它們寫完再關。
+//     禮貌斷線讓 client 收到 1000 而不是 1006，不會誤判成網路問題。
+//  2. 剩下的連線（還在握手、還沒交給 hub 的）只能硬關。
+//     這裡是 main 的 goroutine，而那些連線正卡在自己的 ReadMessage，
+//     從這裡 WriteMessage 就是第二個 writer（AGENTS.md §2.5）。
+//     conn.Close() 則是 gorilla 明確支援的併發操作，也是喚醒 reader 的標準手段。
+//
+// 第 2 步會重複關到已經被 hub 關掉的連線——那是無害的（回一個被忽略的 error），
+// 換來的是「絕對不會漏掉任何一條」。
 func (s *Server) Close() error {
 	s.mu.Lock()
 	s.closed = true
@@ -150,6 +174,8 @@ func (s *Server) Close() error {
 		conns = append(conns, conn)
 	}
 	s.mu.Unlock()
+
+	s.hub.Close(shutdownGrace)
 
 	for _, conn := range conns {
 		_ = conn.Close()
@@ -199,7 +225,7 @@ func (s *Server) untrack(conn *websocket.Conn) {
 	}
 }
 
-// serve 跑完握手，成功後進入 Phase 1 的「讀完就丟」迴圈。
+// serve 跑完握手，成功後把連線交給 hub 接管。
 func (s *Server) serve(conn *websocket.Conn, r *http.Request) {
 	conn.SetReadLimit(maxMessageSize)
 
@@ -208,7 +234,8 @@ func (s *Server) serve(conn *websocket.Conn, r *http.Request) {
 		return
 	}
 
-	result := handshake(s.verifier, frame, rand.Text())
+	sessionID := rand.Text()
+	result := handshake(s.verifier, frame, sessionID)
 	if !result.OK {
 		// 失敗原因只留在伺服器端。對外的 ERROR 帧刻意含糊（見 handshake）。
 		s.log.Info("STOMP 握手失敗",
@@ -219,16 +246,27 @@ func (s *Server) serve(conn *websocket.Conn, r *http.Request) {
 		return
 	}
 
-	if err := writeFrame(conn, result.Reply); err != nil {
-		s.log.Debug("送出 CONNECTED 失敗", "remote", r.RemoteAddr, "err", err)
-		return
-	}
 	s.log.Info("STOMP 連線建立",
 		"playerID", result.PlayerID,
+		"sessionID", sessionID,
 		"remote", r.RemoteAddr,
-		"subprotocol", conn.Subprotocol())
+		"subprotocol", conn.Subprotocol(),
+		"heartbeatSend", result.Heartbeat.Send,
+		"heartbeatRecv", result.Heartbeat.Recv)
 
-	s.drain(conn, result.PlayerID)
+	// CONNECTED 交給 hub 用 write goroutine 送出，不在這裡直接寫——
+	// 這樣「client 收到 CONNECTED」就保證「session 已登記進 hub」，
+	// 中間不會有一段推播與關機通知都漏掉的空窗期。
+	//
+	// Serve 阻塞到連線結束；目前這條 goroutine 就變成該連線的 read goroutine。
+	s.hub.Serve(hub.SessionConfig{
+		Conn:         conn,
+		ID:           sessionID,
+		PlayerID:     result.PlayerID,
+		Greeting:     result.Reply,
+		SendInterval: result.Heartbeat.Send,
+		RecvInterval: result.Heartbeat.Recv,
+	})
 }
 
 // readConnectFrame 讀到第一個真正的帧為止。
@@ -260,54 +298,6 @@ func (s *Server) readConnectFrame(conn *websocket.Conn, r *http.Request) (*stomp
 			return nil, false
 		}
 		return frame, true
-	}
-}
-
-// drain 是 Phase 1 的佔位：握手成功後把收到的帧讀掉並記錄，不做任何處理。
-//
-// 為什麼不直接 return：return 會關掉連線，前端會判定「連上又斷」並開始
-// 重連迴圈，反而看不出握手其實成功了。保持讀取，連線就是活的。
-//
-// Phase 2 會用 hub.Session 取代這裡：SUBSCRIBE 進訂閱表、DISCONNECT 收尾、
-// 另一條 write goroutine 負責推播與心跳。
-func (s *Server) drain(conn *websocket.Conn, playerID string) {
-	// 握手完成，取消讀取逾時。
-	//
-	// 這與 CONNECTED 宣告的 heart-beat:0,0 是一致的：既然告訴對方
-	// 「不需要送心跳給我」，就不能反過來因為對方沉默而斷線。
-	// Phase 2 改成真正協商心跳之後，這裡要換成依協商值設定 deadline。
-	if err := conn.SetReadDeadline(time.Time{}); err != nil {
-		return
-	}
-
-	for {
-		_, data, err := conn.ReadMessage()
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-				s.log.Info("連線非正常中斷", "playerID", playerID, "err", err)
-			} else {
-				s.log.Debug("連線結束", "playerID", playerID, "err", err)
-			}
-			return
-		}
-
-		frame, err := stomp.Unmarshal(data)
-		if errors.Is(err, stomp.ErrHeartbeat) {
-			continue
-		}
-		if err != nil {
-			s.log.Info("握手後收到畸形帧", "playerID", playerID, "err", err)
-			s.reject(conn, errorFrame("Malformed frame", err.Error()))
-			return
-		}
-
-		if frame.Command == stomp.CommandDisconnect {
-			s.log.Debug("對方主動 DISCONNECT", "playerID", playerID)
-			return
-		}
-		// Phase 2 才會處理 SUBSCRIBE / UNSUBSCRIBE。
-		s.log.Debug("Phase 1 尚未處理的帧，已丟棄",
-			"playerID", playerID, "command", frame.Command)
 	}
 }
 

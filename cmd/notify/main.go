@@ -81,7 +81,8 @@ func run() error {
 		logger.Info("服務啟動",
 			"port", cfg.Port,
 			"allowedOrigins", cfg.AllowedOrigins,
-			"logLevel", cfg.LogLevel.String())
+			"logLevel", cfg.LogLevel.String(),
+			"debugPush", cfg.DebugPush)
 		// Shutdown 被呼叫時 ListenAndServe 會回 ErrServerClosed，
 		// 那是正常結束，不是錯誤。
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

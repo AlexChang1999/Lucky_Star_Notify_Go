@@ -76,6 +76,15 @@ type Config struct {
 	AllowedOrigins []string
 	// LogLevel 是 slog 的最低輸出等級。
 	LogLevel slog.Level
+	// DebugPush 決定要不要註冊 POST /debug/push 這個手動灌訊息的端點。
+	//
+	// ⚠️ 這個端點沒有鑑權，開著等於任何能連到本服務的人都能對任意玩家
+	// 推任意內容。**Phase 3 接上 Kafka、以及任何對外部署，都必須設成 false。**
+	//
+	// 預設 true 是刻意的權衡：Phase 2 還沒有 Kafka，關掉的話這個服務
+	// 完全沒有訊息來源，連不上任何可以驗收的東西。啟動時會印一行
+	// WARN 提醒，不會靜默地開著。
+	DebugPush bool
 }
 
 // FromEnv 從真正的行程環境載入設定。
@@ -92,6 +101,7 @@ func Load(lookup LookupFunc) (Config, error) {
 		Port:           DefaultPort,
 		AllowedOrigins: []string{"*"},
 		LogLevel:       slog.LevelInfo,
+		DebugPush:      true,
 	}
 
 	// problems 蒐集所有錯誤，最後用 errors.Join 併成一個。
@@ -140,6 +150,17 @@ func Load(lookup LookupFunc) (Config, error) {
 			problems = append(problems, fmt.Errorf("%w：LOG_LEVEL=%q 認不出來", ErrInvalidValue, raw))
 		} else {
 			cfg.LogLevel = level
+		}
+	}
+
+	if raw, ok := lookup("DEBUG_PUSH"); ok && raw != "" {
+		// ParseBool 認得 1/t/T/true/TRUE/True 與 0/f/F/false/FALSE/False。
+		// 不自己寫 raw == "true" 的比對，那會把 DEBUG_PUSH=1 誤判成關閉。
+		enabled, err := strconv.ParseBool(raw)
+		if err != nil {
+			problems = append(problems, fmt.Errorf("%w：DEBUG_PUSH=%q 不是布林值", ErrInvalidValue, raw))
+		} else {
+			cfg.DebugPush = enabled
 		}
 	}
 

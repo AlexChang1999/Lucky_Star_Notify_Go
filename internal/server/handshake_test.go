@@ -190,9 +190,10 @@ func TestHandshake(t *testing.T) {
 			if v := got.Reply.Headers.Get(stomp.HeaderVersion); v != StompVersion {
 				t.Errorf("version header = %q，預期 %q", v, StompVersion)
 			}
-			if hb := got.Reply.Headers.Get(stomp.HeaderHeartBeat); hb != "0,0" {
-				// Phase 1 沒實作心跳，宣告 0,0 才不會讓 client 等不到心跳就斷線。
-				t.Errorf("heart-beat header = %q，Phase 1 應為 %q", hb, "0,0")
+			// CONNECTED 帶的是伺服器自己的 sx,sy，不是協商結果——
+			// 所以不論 client 送什麼，這個 header 都一樣。
+			if hb := got.Reply.Headers.Get(stomp.HeaderHeartBeat); hb != "10000,10000" {
+				t.Errorf("heart-beat header = %q，預期 %q", hb, "10000,10000")
 			}
 			if got.Reply.Headers.Get("session") != "test-session" {
 				t.Errorf("session header = %q，預期 test-session", got.Reply.Headers.Get("session"))
@@ -260,5 +261,54 @@ func TestAuthFailuresAreIndistinguishable(t *testing.T) {
 				strings.ReplaceAll(seen[0], "\x00", "^@"),
 				strings.ReplaceAll(seen[i], "\x00", "^@"))
 		}
+	}
+}
+
+// TestNegotiateHeartbeat 是心跳協商的表格驅動測試。
+//
+// 規格的公式：任一邊為 0 就關掉該方向，否則取兩者**較大值**。
+// 取 max 而不是 min，是因為兩個數字的語意不同（一邊是「我最快只能這麼快」、
+// 一邊是「我希望這麼頻繁」），能同時滿足雙方的只有較大值。
+//
+// 伺服器端固定是 sx=sy=10000ms，所以下面每一列都以此為前提。
+func TestNegotiateHeartbeat(t *testing.T) {
+	t.Parallel()
+
+	const s = 10 * time.Second
+
+	tests := []struct {
+		name     string
+		header   string
+		wantSend time.Duration
+		wantRecv time.Duration
+	}{
+		{"雙方都要 10 秒", "10000,10000", s, s},
+		{"client 要得比我們快，取我們的下限", "1000,1000", s, s},
+		// cx=30000（它保證每 30s 送一次）、cy=20000（它希望每 20s 收到一次）
+		//   server→client = max(cy=20s, sx=10s) = 20s
+		//   client→server = max(cx=30s, sy=10s) = 30s
+		{"client 要得比我們慢，取它的", "30000,20000", 20 * time.Second, 30 * time.Second},
+		{"client 說它不送（cx=0）→ 關掉 client→server", "0,10000", s, 0},
+		{"client 說它不要收（cy=0）→ 關掉 server→client", "10000,0", 0, s},
+		{"雙向都關", "0,0", 0, 0},
+		{"沒帶 header（STOMP 1.0 行為）", "", 0, 0},
+		{"格式壞掉：沒有逗號", "10000", 0, 0},
+		{"格式壞掉：不是數字", "abc,10000", 0, 0},
+		{"格式壞掉：負數", "-1,10000", 0, 0},
+		{"容忍空白", " 10000 , 10000 ", s, s},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := negotiateHeartbeat(tt.header)
+			if got.Send != tt.wantSend {
+				t.Errorf("Send = %v，預期 %v", got.Send, tt.wantSend)
+			}
+			if got.Recv != tt.wantRecv {
+				t.Errorf("Recv = %v，預期 %v", got.Recv, tt.wantRecv)
+			}
+		})
 	}
 }
