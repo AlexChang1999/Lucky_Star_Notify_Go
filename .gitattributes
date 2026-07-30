@@ -15,6 +15,12 @@ go.sum   text eol=lf
 Dockerfile     text eol=lf
 .dockerignore  text eol=lf
 
+# ⚠️ .env 一定要 LF。docker compose 讀 .env 時，CRLF 會讓每個值都夾帶一個
+# 尾端 \r——於是 JWT_SECRET 變成「secret 加一個看不見的字元」，
+# 驗章永遠失敗，而訊息只會說 signature is invalid（同地雷 §2.1 的症狀，
+# 但成因完全不同，會查錯方向）。
+.env.example   text eol=lf
+
 # Grafana dashboard 等設定檔。
 *.json   text eol=lf
 
