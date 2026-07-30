@@ -165,6 +165,69 @@ module path `github.com/AlexChang1999/lucky-star-notify-go`，**Go 1.24+**。
     之後 `git apply` 只會說 `patch does not apply`，**完全指不到「行尾被改了」
     這個真因**。已用 `*.patch -text` 排除。
 
+22. **Windows 使用者名稱含空白時，WinLibs 的 gcc 完全不能連結**（換機器踩到的）：
+    winget 預設把 WinLibs 裝在 `%LOCALAPPDATA%\...`，若使用者名稱是
+    `Alex Chang` 這種含空白的，gcc 會把自己的安裝前綴解析成長路徑，然後把
+    `crt2.o` / `crtbegin.o` / `-L...` **不加引號**丟給 collect2，ld 就在空白處
+    斷成兩截。錯誤訊息是
+    `C:/Users/Alex: file not recognized: file format not recognized`——
+    **看起來像目的檔壞掉，其實是路徑被切開**。連
+    `int main(){return 0;}` 都連結不了，所以 `go test -race ./...` 全滅。
+    兩個直覺解法**都無效**：
+    - 用 8.3 短檔名（`C:\Users\ALEXCH~1\...`）放進 PATH → gcc 用
+      `GetModuleFileName` 拿到的還是長路徑
+    - 做一個 `C:\mingw64` junction 指過去 → 一樣會被還原成真實路徑
+
+    唯一解是**讓工具鏈實體位於無空白的路徑**：
+    ```powershell
+    winget uninstall -e --id BrechtSanders.WinLibs.POSIX.UCRT
+    winget install -e --id BrechtSanders.WinLibs.POSIX.UCRT --location "C:\toolchains\winlibs"
+    ```
+    ⚠️ 移除 junction 時**不可以** `Remove-Item -Recurse -Force`——PowerShell 5.1
+    會跟著 junction 進去把**目標內容**刪掉。要用 `cmd /c rmdir <link>`，
+    它只拆 reparse point。
+    （Go 本身裝在 `C:\Program Files\Go` 也有空白，但沒事——Go 自己會正確引號。）
+
+23. **⭐ consumer 比 topic 早啟動 → 它會永遠收不到訊息**（Phase 4 實測到的真缺陷）：
+    kafka-go 的 `WatchPartitionChanges` **預設是 false**。加入 group 那一刻
+    topic 還不存在（例如 topic 靠 producer 自動建立，而 producer 比較晚起），
+    這個 member 就被分配到 **0 個 partition**，而且之後**沒有任何事件會觸發
+    rebalance**，於是一直維持那個狀態。
+    症狀最惡劣的地方是**每一項檢查都顯示正常**：healthcheck 過、日誌無錯誤、
+    `kafka-consumer-groups --list` 也看得到 group——但 `--describe` 是空的，
+    `notify_kafka_messages_total` 這個 CounterVec 因為從沒被 Inc 過而**整個
+    不出現在 /metrics 裡**。
+    Java 版沒這問題：Spring Kafka 靠 `metadata.max.age.ms`（預設 5 分鐘）
+    定期刷新中繼資料並重新訂閱，最多五分鐘會自己好。
+    已修：`internal/consumer.New` 設 `WatchPartitionChanges: true` +
+    `PartitionWatchInterval: 5s`。**動那兩行前先讀這一條。**
+
+24. **關機時間 ≈ topic 數 × 3 秒，且改不掉**：三個 topic 是**同一個 consumer
+    group 的三個 member**，coordinator 一次只處理一個 `LeaveGroup`、每次跑一輪
+    rebalance，所以它們是排隊離開的（即使我們這邊三條 goroutine 是並行關的）。
+    實測收工時間恰好每 **3.000 秒**一個，牆鐘 6.5~8.7 秒。
+    ⚠️ **試過的無效解法**：懷疑是 kafka-go 的 `HeartbeatInterval`（預設剛好
+    3 秒），改成 1 秒後**間隔仍是 3.000 秒**，假設不成立，已還原。別再試一次。
+    所以 `shutdownTimeout` 是 10 秒（原訂 5 秒不夠），compose 要配
+    `stop_grace_period: 15s`（**Docker 預設也是 10 秒，剛好卡在邊界，必須明寫**，
+    否則優雅關閉做到一半被 SIGKILL，結束碼變 137）。
+    **加第四個 topic 之前，先把這兩個數字一起調大。**
+
+25. **demo 的觀測性埠會撞到團隊 repo**：團隊那套的 `lucky-star-prometheus`
+    占 9090、`lucky-star-grafana` 占 3000。同時跑會拿到
+    `Bind for 0.0.0.0:9090 failed: port is already allocated`。
+    本專案一律往後挪一號：**Prometheus 9091、Grafana 3001**
+    （與服務用 8088、Java 版 8087 是同一個並存理由）。容器內的埠不變，
+    所以 `prometheus.yml` 與 Grafana 的資料來源都不用改。
+
+26. **Grafana 不要掛整個 `provisioning/` 目錄**：那會把映像內建的
+    `alerting/` `plugins/` `notifiers/` 一起遮掉，啟動時噴
+    `level=error msg="can't read alerting provisioning files"`。
+    沒有實際影響，但日誌裡一行紅字會讓人以為設定壞了。
+    只掛真的有提供的子目錄（`datasources/`、`dashboards/`）就乾淨了。
+    另外 datasource **一定要明寫 `uid`**——dashboard JSON 是用 uid 綁資料來源的，
+    不給的話 Grafana 隨機產生，每個面板都會顯示 "Datasource not found"。
+
 ---
 
 ## 3. 約定速查
@@ -176,7 +239,15 @@ module path `github.com/AlexChang1999/lucky-star-notify-go`，**Go 1.24+**。
 - 已引入（Phase 1）：`gorilla/websocket`、`golang-jwt/jwt/v5`、`prometheus/client_golang`、
   `log/slog`（標準庫，**不用第三方 logger**）
 - 已引入（Phase 3）：`segmentio/kafka-go`（**純 Go，可 `CGO_ENABLED=0` 靜態編譯**）
-- Port：**8088**（Java 版是 8087，刻意錯開以便併存 A/B）
+- Phase 4 沒有新增任何 Go 依賴（容器化與 CI 都不需要）
+- **對外埠一覽**（全部刻意與團隊 repo 錯開，兩套才能同時跑做 A/B）：
+
+  | 埠 | 用途 | 團隊 repo 的對應 |
+  |---|---|---|
+  | **8088** | notify-go | Java 版 8087 |
+  | **8090** | demo 頁面 + dev token 端點（`cmd/demo`，**不是服務的一部分**） | — |
+  | **9091** | Prometheus（`observability` profile） | 9090 |
+  | **3001** | Grafana（`observability` profile） | 3000 |
 - 對外端點：`/ws`（WebSocket）、`/actuator/health`、`/metrics` 與 `/actuator/prometheus`（同一個 handler 註冊兩次，方便接團隊的 Prometheus）、
   `POST /debug/push`（**只在 `DEBUG_PUSH=true` 時註冊**，關掉時是 404 不是 403）
 - 環境變數：`JWT_SECRET`（**必填**，≥ 32 bytes，原始字串不是 base64）、
@@ -198,6 +269,24 @@ module path `github.com/AlexChang1999/lucky-star-notify-go`，**Go 1.24+**。
 ### 目錄
 `internal/` 底下是實作細節（外部 module 無法 import，比 Java 的 package-private 更硬）。
 完整規劃見 `計畫說明書.md` §5.1。**空目錄 git 不會追蹤**，所以只有裝了程式碼的目錄會進 repo。
+
+### 容器與部署（Phase 4）
+- **兩個執行檔、兩個映像，共用同一份 `Dockerfile`**（`ARG CMD`，預設 `notify`）：
+  - `cmd/notify` → 正式服務。`docker build .` 蓋出來的就是它。
+  - `cmd/demo` → **開發用**假上游：產生假事件、服務 demo 頁、**簽發 JWT**。
+    ⚠️ 簽章能力只能存在於這裡。正式映像裡沒有這段程式碼，就不可能被誤開。
+- base image 是 **`scratch`**，不是計畫書原訂的 distroless（那個實測 23.7 MB
+  超過 20 MB 的 DoD；差額幾乎全是用不到的 tzdata）。改用 scratch 就得自己補回：
+  CA 憑證（從建置階段 COPY）、**數字 UID `65532:65532`**（沒有 /etc/passwd
+  就不能寫 `USER nonroot`，寫了容器起不來）。時區資料刻意不補。
+- 沒有 shell 的兩個後果：`docker exec ... sh` 進不去；`HEALTHCHECK CMD curl`
+  用不了——所以探針是執行檔自己的 **`/app -healthcheck`** 旗標
+  （compose 用 `test: ["CMD", "/app", "-healthcheck"]`，**不能用 CMD-SHELL**）。
+- 實測數字（2026-07-30，第二台機器）：映像 **18.6 MB**（`docker images`）／
+  5.29 MB（pull 下載量）；服務啟動 **230 ms**；閒置記憶體 **12.9 MiB**／128 MiB 上限；
+  p95 推播延遲 **4.75 ms**。
+- `GOMEMLIMIT` 要與容器記憶體上限**成對設定**且略低於它（現為 100MiB／128M）——
+  這是 Java 那條「`mem_limit` 與 `-Xmx` 要成對」在 Go 的對應物。
 
 ### Git / 提交
 - **個人 repo，單人開發**：直接在 `main` 上做，不搞 fork/PR（團隊 repo 那套在這裡是純負擔）
@@ -236,6 +325,29 @@ go test -coverprofile=coverage.out ./internal/stomp/ && go tool cover -html=cove
 go test -fuzz=FuzzReadFrame -fuzztime=30s ./internal/stomp/
 ```
 
+**跑起來看（Phase 4）**：
+
+```bash
+# 整組 demo：Kafka + notify-go + 假上游/頁面。--wait 會等到全部 healthy 才返回
+docker compose -f deploy/docker-compose.yml up --build -d --wait
+#   → 打開 http://localhost:8090
+
+# 加上 Prometheus(9091) 與 Grafana(3001)。預設不啟動，因為映像比整組 demo 還大
+docker compose -f deploy/docker-compose.yml --profile observability up -d
+
+# 收工。⚠️ 開過 observability 的話，down 也要帶同一個 --profile，
+# 否則那兩個容器會留著，網路刪不掉（"Resource is still in use"）
+docker compose -f deploy/docker-compose.yml --profile observability down -v
+```
+
+**看服務有沒有真的在消費**：`notify_kafka_messages_total` 是 CounterVec，
+**從沒被 Inc 過就整個不會出現在 /metrics 裡**——「grep 不到」等於「一則都沒收到」，
+不是「指標壞了」。這是判斷地雷 §2.23 有沒有復發的最快方法。
+
+```bash
+curl -s localhost:8088/actuator/prometheus | grep notify_kafka_messages_total
+```
+
 **規則**：
 - **`-race` 是本專案的硬性要求，不是選配**。這是一個併發服務，沒有競態偵測器的測試等於沒測。
   （Java 沒有等價工具，這點值得在 README 講。）
@@ -245,20 +357,29 @@ go test -fuzz=FuzzReadFrame -fuzztime=30s ./internal/stomp/
   `go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest`
   裝好在 `%USERPROFILE%\go\bin`，記得那個目錄要在 PATH 裡。
 
-**Windows 本機環境**（2026-07-30 實測）：
-- Go 與 gcc 都**不在**預設 PATH，跑指令前要自己補：
+**Windows 本機環境**：
+> ⚠️ 這一節**跟機器綁定**。已經在兩台上跑過，路徑不一樣，所以下面列的是
+> 「怎麼在新機器上把它裝起來」而不是某一台的絕對路徑。
+
+- 新機器一次裝好（實測 2026-07-30，第二台）：
   ```powershell
-  $env:PATH = "C:\Program Files\Go\bin;" +
-    "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin;" +
-    "$env:USERPROFILE\go\bin;$env:PATH"
+  winget install -e --id GoLang.Go
+  # gcc 的安裝位置「絕對不能含空白」，見地雷 §2.22
+  winget install -e --id BrechtSanders.WinLibs.POSIX.UCRT --location "C:\toolchains\winlibs"
+  go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
   ```
-  在 **Git Bash** 裡不能直接沿用上面那串：`$LOCALAPPDATA` 展開出來是含反斜線的
-  `C:\Users\...`，塞進 bash 的 `PATH` 會找不到 gcc，錯誤訊息還是那句
-  `-race requires cgo`（指不到真因，見地雷 §2.9）。要用全正斜線的形式：
+- Go 與 gcc 都**不在**預設 PATH（而且 Claude Code 起的子行程拿到的是舊 PATH
+  快照，安裝後也不會自動更新），跑指令前要自己補：
+  ```powershell
+  $env:PATH = "C:\Program Files\Go\bin;C:\toolchains\winlibs\mingw64\bin;$env:USERPROFILE\go\bin;$env:PATH"
+  ```
+  在 **Git Bash** 裡不能直接沿用上面那串（反斜線路徑塞進 bash 的 `PATH` 找不到
+  gcc，錯誤訊息還是那句 `-race requires cgo`，指不到真因，見地雷 §2.9）。
+  要用全正斜線的形式，`<user>` 換成實際使用者資料夾名：
   ```bash
-  export PATH="/c/Program Files/Go/bin:/c/Users/User/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/bin:/c/Users/User/go/bin:$PATH"
+  export PATH="/c/Program Files/Go/bin:/c/toolchains/winlibs/mingw64/bin:/c/Users/<user>/go/bin:$PATH"
   ```
-- gcc 是 `-race` 的前提，見地雷 §2.9。
+- gcc 是 `-race` 的前提，見地雷 §2.9；它裝在哪更關鍵，見地雷 §2.22。
 - ⚠️ 用 PowerShell 的 `Get-Content` 看含中文的檔案會顯示成亂碼（編碼判斷錯誤），
   那是**顯示問題不是檔案壞了**。要確認內容請用編輯器或 `Get-Content -Encoding utf8`。
 - ⚠️ 對原生 exe 做 `2>&1` 重導向，PowerShell 5.1 會把 stderr 每一行包成 ErrorRecord

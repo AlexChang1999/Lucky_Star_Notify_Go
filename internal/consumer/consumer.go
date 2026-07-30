@@ -23,7 +23,31 @@ const (
 
 	// maxFetchBytes 是單次 fetch 的回傳上限。
 	maxFetchBytes = 10 << 20
+
+	// partitionWatchInterval 是檢查 partition 數有沒有變的間隔。
+	//
+	// 這個機制真正在防的是「topic 比 consumer 晚出現」，見 New 裡的說明。
+	// 5 秒是 kafka-go 的預設值，明寫出來是因為它與那個坑直接相關——
+	// 留白會讓讀的人以為沒有在監看。
+	partitionWatchInterval = 5 * time.Second
 )
+
+// 關機為什麼是「每個 topic 約 3 秒」——一個試過並排除的假設，記在這裡
+// 免得下次有人重走一遍。
+//
+// 實測（Phase 4，compose 上三個 topic）：三個 reader 的收工時間**恰好
+// 相隔 3.000 秒**，總關機時間 ≈ topic 數 × 3 秒。
+//
+// 直覺的嫌疑犯是 kafka-go 的 HeartbeatInterval（預設剛好 3 秒）——
+// Reader.Close() 要等自己的 heartbeat goroutine 收到取消。
+// **試過了，把它設成 1 秒，間隔還是 3.000 秒。假設不成立。**
+// 真正的原因在 broker 端：coordinator 一次只處理一個 member 的
+// LeaveGroup，每次都要跑完一輪 rebalance，所以三個 member 是排隊離開的，
+// 與 client 這邊的設定無關。
+//
+// 結論：這個成本改不掉，只能把關機預算訂得夠大（見 cmd/notify 的
+// shutdownTimeout）。⚠️ 它會**隨 topic 數線性成長**——之後要加第四個
+// topic，先回去把那個預算一起調大。
 
 // 處理結果，直接當成 metrics.KafkaMessages 的 result 標籤值。
 const (
@@ -84,6 +108,20 @@ func New(topic string, brokers []string, groupID string, p Pusher, log *slog.Log
 		// 這是即時推播，吞吐讓給延遲。
 		MinBytes: 1,
 		MaxBytes: maxFetchBytes,
+		// ★ 少了這兩行，consumer 比 topic 早啟動就會**永遠**收不到訊息。
+		//
+		// kafka-go 預設 WatchPartitionChanges = false：加入 group 那一刻
+		// topic 不存在 → 分配到 0 個 partition → 之後就一直維持那個狀態，
+		// 因為沒有任何事件會觸發 rebalance。服務看起來完全正常
+		// （健康檢查過、日誌無錯誤、group 也在），但一則都不會消費。
+		// 這是 2026-07-30 在 Phase 4 的 compose 上實測到的：topic 由
+		// producer 自動建立，而 producer 比 consumer 晚幾秒，就中了。
+		//
+		// Java 版沒有這個問題——Spring Kafka 靠 metadata.max.age.ms
+		// （預設 5 分鐘）定期刷新中繼資料並重新訂閱，最多五分鐘會自己好。
+		// 開啟這個選項就是補上等價的行為，代價只是每 5 秒一次中繼資料查詢。
+		WatchPartitionChanges:  true,
+		PartitionWatchInterval: partitionWatchInterval,
 		// kafka-go 內部的訊息（連線、rebalance）導進 slog。
 		// 不接的話它會直接寫 stderr，變成日誌裡唯一不是 JSON 的那幾行，
 		// 收集器解析不了。

@@ -1,0 +1,177 @@
+{
+  "uid": "lucky-notify-go",
+  "title": "Lucky Star Notify (Go)",
+  "description": "推播服務的四個自訂指標，加上 Go runtime 的記憶體與 goroutine 數（Phase 5 效能對照的數據來源）。",
+  "tags": ["lucky-star", "go", "websocket"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "目前 WebSocket 連線數",
+      "description": "Gauge：會上下浮動，所以不是 Counter。",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus-notify" },
+      "targets": [
+        { "refId": "A", "expr": "notify_ws_connections", "legendFormat": "連線數" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "text", "value": null }] } },
+        "overrides": []
+      },
+      "options": { "graphMode": "area", "colorMode": "value", "textMode": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } }
+    },
+    {
+      "type": "stat",
+      "title": "goroutine 數",
+      "description": "每條連線固定 2 個（一讀一寫），所以這個數字約等於 連線數×2 + 固定開銷。偏離太多就代表有 goroutine 洩漏。",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus-notify" },
+      "targets": [
+        { "refId": "A", "expr": "go_goroutines", "legendFormat": "goroutines" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "decimals": 0 },
+        "overrides": []
+      },
+      "options": { "graphMode": "area", "colorMode": "none", "textMode": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } }
+    },
+    {
+      "type": "stat",
+      "title": "常駐記憶體 (RSS)",
+      "description": "process_resident_memory_bytes。這是 Java 版對照的關鍵數字——Java 那邊的 mem_limit 是 1280m。",
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus-notify" },
+      "targets": [
+        { "refId": "A", "expr": "process_resident_memory_bytes", "legendFormat": "RSS" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "bytes", "decimals": 1 },
+        "overrides": []
+      },
+      "options": { "graphMode": "area", "colorMode": "none", "textMode": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } }
+    },
+    {
+      "type": "stat",
+      "title": "背壓斷線 (5 分鐘內)",
+      "description": "outbound channel 塞滿而被踢掉的慢速客戶端。正常應該是 0；持續增加代表有客戶端讀不贏推播速度。",
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus-notify" },
+      "targets": [
+        { "refId": "A", "expr": "increase(notify_outbound_dropped_total[5m])", "legendFormat": "被斷線" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "thresholds" },
+          "thresholds": { "mode": "absolute",
+            "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] } },
+        "overrides": []
+      },
+      "options": { "graphMode": "area", "colorMode": "value", "textMode": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Kafka 訊息處理速率（依 topic / 結果）",
+      "description": "result 三個值意義完全不同：ok 正常；dropped 是上游送了壞 JSON（上游的 bug）；skipped 是格式合法但缺路由欄位（上游的正常變異）。dropped 竄高值得叫人起床，skipped 不值得。",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus-notify" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (topic, result) (rate(notify_kafka_messages_total[1m]))",
+          "legendFormat": "{{topic}} · {{result}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10,
+            "showPoints": "never", "spanNulls": false }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*dropped.*" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }]
+          }
+        ]
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom",
+        "calcs": ["lastNotNull"], "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "推播延遲分位數",
+      "description": "量的是「Kafka 訊息時間戳 → 訊息進入連線的送出佇列」。⚠️ 時間戳是 producer 那端打的，跨機量測時含時鐘偏移；而且不含實際 TCP 寫出（那取決於客戶端網路）。",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus-notify" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(notify_push_latency_seconds_bucket[1m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(notify_push_latency_seconds_bucket[1m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(notify_push_latency_seconds_bucket[1m])))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 0,
+            "showPoints": "never", "spanNulls": true }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "記憶體與 goroutine",
+      "description": "左軸是 Go 堆疊/常駐記憶體，右軸是 goroutine 數。兩條一起看，才分得出「連線變多」與「有東西洩漏」。",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "prometheus-notify" },
+      "targets": [
+        { "refId": "A", "expr": "process_resident_memory_bytes", "legendFormat": "RSS" },
+        { "refId": "B", "expr": "go_memstats_heap_inuse_bytes", "legendFormat": "heap in-use" },
+        { "refId": "C", "expr": "go_goroutines", "legendFormat": "goroutines" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 8,
+            "showPoints": "never", "spanNulls": true }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "goroutines" },
+            "properties": [
+              { "id": "unit", "value": "short" },
+              { "id": "custom.axisPlacement", "value": "right" },
+              { "id": "custom.fillOpacity", "value": 0 }
+            ]
+          }
+        ]
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" } }
+    }
+  ]
+}

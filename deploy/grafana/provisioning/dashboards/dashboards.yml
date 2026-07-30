@@ -1,0 +1,16 @@
+# 告訴 Grafana 去哪裡找 dashboard JSON。
+#
+# 有這個檔，dashboard 才會在啟動時自動出現——否則 JSON 放在容器裡也沒人讀。
+apiVersion: 1
+
+providers:
+  - name: lucky-star-notify
+    type: file
+    # 讓 dashboard 在 UI 上是唯讀的：它的真相來源是 repo 裡的 JSON，
+    # 在 UI 改完卻沒同步回檔案，下次重啟就會被蓋掉。
+    disableDeletion: true
+    allowUiUpdates: false
+    options:
+      # 對應 compose 掛進來的路徑。
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

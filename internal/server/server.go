@@ -46,8 +46,11 @@ const (
 
 	// shutdownGrace 是關機時，等所有連線收到 ERROR 帧並乾淨關閉的上限。
 	//
-	// 3 秒是從 main 的 5 秒總預算裡切出來的：留 2 秒給 http.Server.Shutdown
-	// 處理一般 HTTP 請求。超過就硬關——關不掉比慢一點更糟。
+	// 3 秒是從 main 的關機總預算裡切出來的一段（見 cmd/notify 的
+	// shutdownTimeout：實測後從 5 秒調成 10 秒，因為 Kafka 的 LeaveGroup
+	// 比預期慢）。這一段維持 3 秒沒有改：實測 0 條連線時是毫秒級，
+	// 而 3 秒對「送一個 ERROR 帧再等對方讀走」已經很寬裕。
+	// 超過就硬關——關不掉比慢一點更糟。
 	shutdownGrace = 3 * time.Second
 )
 

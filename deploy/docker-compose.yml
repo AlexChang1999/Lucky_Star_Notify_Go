@@ -1,0 +1,198 @@
+# 最小可獨立運行的展示環境。
+#
+#   docker compose -f deploy/docker-compose.yml up --build
+#   → 打開 http://localhost:8090
+#
+# 這個檔案的目標是 Phase 4 的第一項 DoD：**在一台沒有團隊 repo 的機器上**，
+# git clone 之後只要有 Docker 就能看到推播即時跳出來。所以裡面不能有任何
+# 對外部服務的依賴——Kafka、事件來源、前端頁面全部自帶。
+#
+# 想接團隊 repo 既有的 Kafka，用 docker-compose.team.yml。
+#
+# 觀測性（Prometheus + Grafana）放在 observability profile，預設不啟動：
+#   docker compose -f deploy/docker-compose.yml --profile observability up
+#   → Prometheus http://localhost:9091 、Grafana http://localhost:3001
+# 理由是那兩個映像加起來比整組 demo 還大，而看推播能不能動並不需要它們。
+#
+# ── 對外埠一覽（全部刻意與團隊 repo 錯開，才能同時跑做 A/B 對照）──
+#   8088  notify-go       （團隊的 Java 版是 8087）
+#   8090  demo 頁面
+#   9091  Prometheus      （團隊的是 9090）
+#   3001  Grafana         （團隊的是 3000）
+
+name: lucky-star-notify-go
+
+services:
+  # ── Kafka（單節點 KRaft）────────────────────────────────────────────
+  # KRaft = 不需要 ZooKeeper，broker 自己兼任 controller。
+  # 對 demo 來說這是關鍵：少一個容器、少一個啟動順序問題。
+  kafka:
+    image: apache/kafka:4.1.0
+    container_name: notify-demo-kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      # 一個節點同時扮演 broker 與 controller。正式環境會拆開，
+      # 但那需要至少三個節點，對 demo 是純負擔。
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      # ⚠️ advertised listener 是 client 拿到的「請連這裡」位址。
+      # broker 回給 client 的就是這個字串，所以它必須是 **client 那一端
+      # 解析得到的名稱**——這裡的 client 是 compose 網路內的 notify-go 與
+      # demo，所以用容器名 kafka。
+      # 寫成 localhost 的話，容器內的 client 會去連自己的 127.0.0.1，
+      # 症狀是「bootstrap 連得上但之後所有請求都失敗」，而錯誤訊息完全
+      # 指不到這裡。這是 Kafka 容器化最經典的坑。
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+
+      # 單節點必須把所有 replication factor 降到 1，否則內部 topic
+      # （__consumer_offsets 等）建不起來，broker 起來了卻不能用。
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # 預設 3 秒。demo 只有一個 consumer group，等那 3 秒沒有意義。
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # demo 容器的 writer 也帶了 AllowAutoTopicCreation，兩邊都開才保險：
+      # 少了 broker 這一側，writer 的建立請求會被拒絕。
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # 固定 cluster id，讓重複啟動的行為可預期。
+      CLUSTER_ID: 5L6g3nShT-eMCtK--X86sw
+
+    # 刻意**不掛 volume**：每次 up 都是乾淨的 Kafka。
+    # demo 要的是可重現，不是保存歷史；留著舊資料反而會讓
+    # 「為什麼一開始就有一堆訊息」變成新的困惑。
+    healthcheck:
+      # 這個腳本連得上 broker 才會回 0，比 `nc -z 9092` 誠實得多——
+      # 後者在 broker 還在初始化、埠已經開了的那幾秒會誤判成健康。
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 15s
+
+  # ── 推播服務（本專案的正式產出）──────────────────────────────────
+  notify-go:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: lucky-notify-go:latest
+    container_name: notify-go
+    ports:
+      - "8088:8088"
+    environment:
+      # ⚠️ 這是 **demo 用的固定 secret**，只因為要讓 clone 完就能跑。
+      # 任何真實部署都必須從外部帶入（.env 或密鑰管理系統）。
+      # 至少 32 bytes 是硬性要求，見 internal/config.MinSecretLen。
+      JWT_SECRET: ${JWT_SECRET:-lucky-star-demo-secret-do-not-use-in-production}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_GROUP_ID: notification-service-go-group
+      # ⚠️ 接上 Kafka 之後一律關掉：這個端點沒有鑑權，
+      # 開著等於任何連得到本服務的人都能對任意玩家推任意內容。
+      DEBUG_PUSH: "false"
+      # 明確列出而不是用預設的 "*"。瀏覽器打開的是 8090 那一頁，
+      # 所以來源是 http://localhost:8090。兩種寫法都列是因為
+      # localhost 與 127.0.0.1 對瀏覽器是**不同的 origin**，
+      # 只寫一個的話另一個會拿到 403，而 console 只會說
+      # 「WebSocket connection failed」（AGENTS.md §2.10）。
+      ALLOWED_ORIGINS: http://localhost:8090,http://127.0.0.1:8090
+      # Go 沒有 -Xmx，但有 GOMEMLIMIT（軟上限，超過就更積極 GC）。
+      # 設得比容器上限低一截，是為了留出「GC 還沒跑完但記憶體已經在漲」
+      # 的緩衝——貼齊上限的話會來不及回收就被 OOMKilled。
+      # 這是 Java 那條「mem_limit 與 -Xmx 要成對」規則在 Go 的對應物。
+      GOMEMLIMIT: 100MiB
+    depends_on:
+      kafka:
+        condition: service_healthy
+    # ⚠️ 一定要比服務自己的 shutdownTimeout（10 秒）長，否則 Docker 會在
+    # 優雅關閉做完之前送 SIGKILL，容器的結束碼變成 137，而 Kafka 的
+    # LeaveGroup 沒送出去 → 下次啟動要等 session timeout 才 rebalance。
+    # Docker 的預設值剛好也是 10 秒，等於卡在邊界上，所以必須明寫。
+    stop_grace_period: 15s
+    healthcheck:
+      # 映像是 scratch，沒有 curl 也沒有 shell，所以探針就是服務自己。
+      # 用 CMD（exec 形式）而不是 CMD-SHELL——後者需要 /bin/sh。
+      test: ["CMD", "/app", "-healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          # 128 MB。Java 版對照組是 mem_limit 1280m + -Xmx1g，
+          # 也就是十倍。這個數字是 Phase 5 效能對照報告的素材之一，
+          # 實際用量要用 docker stats 量出來再寫進報告。
+          memory: 128M
+
+  # ── 假上游 + demo 頁面（開發用，不是產品的一部分）────────────────
+  demo:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        # 同一份 Dockerfile，只換編哪個 cmd。
+        CMD: demo
+    image: lucky-notify-demo:latest
+    container_name: notify-demo
+    ports:
+      - "8090:8090"
+    environment:
+      # 必須與 notify-go 用同一把，否則簽出來的 token 驗不過。
+      JWT_SECRET: ${JWT_SECRET:-lucky-star-demo-secret-do-not-use-in-production}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      # ⚠️ 這個位址是給**瀏覽器**用的，不是給容器用的。
+      # 瀏覽器跑在宿主上，解析不到 compose 內部的 DNS，
+      # 所以這裡必須是 localhost:8088 而不是 notify-go:8088。
+      NOTIFY_WS_URL: ws://localhost:8088/ws
+      EVENT_INTERVAL: 3s
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  # ── 觀測性（預設不啟動，見檔案開頭）──────────────────────────────
+  prometheus:
+    image: prom/prometheus:v3.7.3
+    container_name: notify-demo-prometheus
+    profiles: [observability]
+    ports:
+      # ⚠️ 9091 而不是 9090。團隊 repo 的 compose 已經把 9090 用掉了
+      # （容器 lucky-star-prometheus），兩邊同時跑會拿到
+      # "Bind for 0.0.0.0:9090 failed: port is already allocated"。
+      # 這與服務本身用 8088（Java 版 8087）是同一個理由：
+      # 本專案的每一個對外埠都刻意與團隊那套錯開，才能並存做 A/B 對照。
+      # 容器內仍是 9090，所以 prometheus.yml 與 Grafana 的資料來源都不用改。
+      - "9091:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - notify-go
+
+  grafana:
+    image: grafana/grafana:12.3.0
+    container_name: notify-demo-grafana
+    profiles: [observability]
+    ports:
+      # 3001 而不是 3000，理由同上：團隊 repo 的 lucky-star-grafana 占著 3000。
+      - "3001:3000"
+    environment:
+      # demo 環境免登入。正式環境當然不能這樣。
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      # provisioning 讓 dashboard 與資料來源在啟動時就存在，
+      # 不必手動點 UI 匯入——「clone 完直接看得到」也適用於觀測性。
+      #
+      # ⚠️ 刻意只掛這兩個子目錄，**不掛整個 provisioning/**。
+      # 掛整個目錄會把映像內建的 alerting/ plugins/ notifiers/ 一起遮掉，
+      # Grafana 啟動時就會噴
+      # `level=error msg="can't read alerting provisioning files"`。
+      # 那個錯誤沒有實際影響，但日誌裡一行紅字會讓人以為設定壞了。
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus

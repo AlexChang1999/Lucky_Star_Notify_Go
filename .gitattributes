@@ -12,7 +12,16 @@ go.sum   text eol=lf
 *.yml    text eol=lf
 *.yaml   text eol=lf
 *.sh     text eol=lf
-Dockerfile text eol=lf
+Dockerfile     text eol=lf
+.dockerignore  text eol=lf
+
+# Grafana dashboard 等設定檔。
+*.json   text eol=lf
+
+# ⚠️ cmd/demo/index.html 是用 go:embed **編進執行檔**的。
+# 讓 Windows checkout 把它轉成 CRLF，等於同一份原始碼在不同平台編出
+# 不同位元組的執行檔——那正好抵銷掉 -trimpath 想達成的可重現建置。
+*.html   text eol=lf
 
 # 二進位檔不要做任何行尾轉換
 *.png binary

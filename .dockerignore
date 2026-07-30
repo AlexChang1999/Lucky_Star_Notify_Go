@@ -1,0 +1,33 @@
+# 不要進 build context 的東西。
+#
+# 為什麼重要：`COPY . .` 之前，Docker 會把整個 context 打包送給 daemon。
+# .git 在這個專案已經比原始碼大，送過去純粹是浪費時間；更糟的是
+# **context 的內容會影響快取命中**——.git 每 commit 都變，等於每次建置
+# 都讓 COPY 那一層失效，前面辛苦排的層順序全白做。
+
+# ── 版本控制 ──
+.git
+.gitignore
+.gitattributes
+
+# ── 文件（不影響建置產物）──
+*.md
+docs/
+計畫說明書.md
+
+# ── 部署設定（compose 讀的是宿主上的檔案，不需要進映像）──
+deploy/
+.github/
+
+# ── 本機產物與祕密 ──
+bin/
+*.exe
+*.test
+coverage.out
+coverage.html
+.env
+.env.*
+
+# ── 編輯器 ──
+.idea/
+.vscode/
