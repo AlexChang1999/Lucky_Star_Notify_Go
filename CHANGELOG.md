@@ -5,6 +5,73 @@
 
 ---
 
+## [feat] — 2026-07-31 — Phase 5：跨語言契約測試、效能對照與作品集 README
+
+Phase 5 的三項 DoD 全部完成，專案六個 Phase 到此收尾。
+
+**Added**
+- **`test/contract/`——跨語言黑箱契約測試**。Node.js + `@stomp/stompjs` +
+  `kafkajs`，14 個案例，只吃 `WS_TARGET` / `KAFKA_BROKER` / `JWT_SECRET`
+  三個環境變數，**測試碼裡沒有任何一行認得出對面是 Java 還是 Go**。
+  刻意用第三方 client 而不是自己寫：用自家 client 測自家 server，證明的只是
+  「我的兩份實作互相相容」，用前端實際在用的那一支才是「與規格相容」。
+  斷言涵蓋幾個**天生沒有錯誤訊息**的差異：`game.result` 的推播不含
+  `playerId` 且 `type` 在第一個、`null` 欄位是「存在且為 null」而不是消失、
+  MESSAGE 帧必帶 `subscription` 與 `message-id`、JSON 不做 HTML 轉義、
+  以及 `alg: none` 等五種爛憑證都要回 ERROR 並斷線。
+- **`test/load/`——Go 壓測 client**。N 條長連線 + R 輪廣播，量握手延遲與
+  扇出延遲（最近排名法，不插值也不印平均值）。同一支程式壓兩邊。
+- **`docs/效能對照報告.md`**。全部實測，含一整節「這份報告**沒有**證明的事」。
+- **CI 多一步：契約測試（Go 版）** 進 `compose 煙霧測試` job。
+  Java 版那一組進不了 CI（需要團隊 repo 的原始碼），但把 Go 這一側釘住，
+  等價性至少不會**無聲**失效。
+- demo 的 Kafka 多開一個 `HOST` listener（宿主 **9094**，與團隊的 9092 錯開），
+  契約測試與壓測才能從宿主發事件。
+
+**Fixed**
+- **`cmd/demo` 每一則事件都被 producer 端壓了整整一秒才送出**。
+  `kafka-go` 的 `Writer.BatchTimeout` 預設是 1 秒、`BatchSize` 預設 100，
+  而這個產生器一次只寫一則。demo 頁上的「即時推播」因此無端慢一秒，
+  **日誌與指標都看不出來**——`notify_push_latency_seconds` 量的是 Kafka
+  訊息時間戳之後的事，那一秒發生在它之前。設 `BatchSize: 1` 修掉。
+  是做扇出延遲量測時才發現的（地雷 §2.29）。
+- 壓測的失敗統計用完整錯誤字串當 map 的 key，而 net 錯誤裡帶著**本地埠號**，
+  於是 3000 條失敗印出 3000 行「各一種」。改成拆掉位址後再分類，並依數量排序
+  （map 走訪順序是隨機的，不排序會讓同一場壓測兩次跑出不同順序的輸出）。
+
+**Changed**
+- README 依計畫書 §12 的順序重寫成作品集門面。**沒有做 demo GIF**——
+  `docker compose up` 一行指令比一張 GIF 更能證明東西真的跑得起來。
+- `AGENTS.md` 新增地雷 §2.29~§2.32，並補上 `GOMEMLIMIT` 的**容量抓法**。
+
+**為什麼**
+「我用 Go 重寫了一個服務」這句話本身沒有說服力，因為無法查證。
+Phase 5 做的全部是**把主張換成證據**：等價性換成一份兩邊都跑得過的測試，
+效能換成可重現的實測，而且**連 Go 沒有贏的那一項都照實寫進去**
+（記憶體充足時扇出 p50 只差 1.15×，Go 並沒有快一個數量級）。
+挑贏的講會讓整份報告失去可信度。
+
+**如何驗證**
+- 契約測試：Go 版 **14/14**、Java 版 **14/14**，而且 Java 版是**第一次跑就過**，
+  沒有為了配合它改過任何斷言
+- 效能對照（實測，co-located，詳見報告）：映像 27× 小、冷啟動 16× 快
+  （301ms vs 4791ms）、閒置記憶體 28× 少（7.6MiB vs 218MiB）、
+  5000 連線握手 p99 89× 好（12.7ms vs 1131ms）；扇出 p50 只差 1.15×
+- `gofmt -l` 無輸出、`go vet`、`golangci-lint`（0 issues）、`go test -race ./...` 全綠
+
+**踩到並記進 AGENTS.md 的四個新雷**
+1. §2.29 `kafka-go` 的 `BatchTimeout` 預設 1 秒（上面那個 demo bug 的成因）
+2. §2.30 **Docker Desktop 上壓測不能從宿主打**：5000 條有 3011 條被 reset，
+   連壓測程式對 Kafka 的連線也一起——是宿主埠轉發層，不是服務。
+   改成網內施壓後全通，而且握手 p50 從 8.35ms 變 0.86ms（原本量的是轉發層）
+3. §2.31 `docker rm -f` 殺 consumer 會留幽靈 member（§2.4 的變形），
+   下一個容器可能分不到 partition。量 Java 記憶體下限時真的踩到，
+   差點把「256m 下收不到訊息」當成 Java 的缺陷寫進報告
+4. §2.32 `GOMEMLIMIT` 是**軟上限**：貼上去不會死，會變慢（5000 條 @128MB
+   零丟包但扇出 p95 從 44.8ms 惡化到 552ms）。也就是現在的 128M 只夠約 1000 條
+
+---
+
 ## [chore] — 2026-07-31 — 從團隊 repo 移植 subagent，6 個只留 2 個
 
 團隊 repo `H:\Lucky_Star_Casino\.claude\agents\` 有 6 個角色定義。

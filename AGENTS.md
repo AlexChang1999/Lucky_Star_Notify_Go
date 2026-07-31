@@ -250,6 +250,44 @@ module path `github.com/AlexChang1999/lucky-star-notify-go`，**Go 1.24+**。
     在 goroutine 裡要嘛只用 `t.Errorf` 後 `return`，要嘛把錯誤用 channel
     送回主 goroutine。最簡單的解法通常是**根本不要開那條 goroutine**。
 
+29. **`kafka-go` 的 `Writer.BatchTimeout` 預設是 1 秒**（`BatchSize` 預設 100）：
+    一次只寫一則訊息時，它會在 producer 端**整整壓一秒**才送出。
+    `cmd/demo` 每 3 秒發一則，於是 demo 頁上的「即時推播」無端慢一秒，
+    而且**日誌與指標都看不出來**——`notify_push_latency_seconds` 量的是
+    Kafka 訊息時間戳之後的事，這一秒發生在它之前。
+    做 Phase 5 的扇出延遲量測時才發現（壓測用事件裡的 `updatedAt` 算延遲，
+    那一秒會**整個算進去**，p50 直接變成 1 秒出頭，看起來像伺服器很慢）。
+    ⚠️ **任何低頻、單則寫入的 writer 都要設 `BatchSize: 1`**。
+    已修：`cmd/demo` 與 `test/load`。
+
+30. **⭐ 在 Docker Desktop 上，壓測不能從宿主打**（Phase 5 實測）：
+    5000 條連線從宿主連進容器，**3011 條在 dial 階段被 reset**
+    （`An existing connection was forcibly closed by the remote host`），
+    而且**壓測程式自己對 Kafka 的連線也一起被 reset**——那是另一個容器、
+    另一個埠。兩件事同時失敗，指向共同的上游：**宿主的埠轉發層**，
+    而不是被測服務。改成把施壓端放進 compose 網路（`docker run --network ...`
+    掛一個 Linux 版執行檔）之後，5000 條**全部連上、一則不漏**。
+    順帶：網內握手 p50 是 **0.86ms**，經宿主轉發是 **8.35ms**——
+    近十倍的差距全是轉發層的成本，量到的根本不是服務。
+
+31. **`docker rm -f` 殺掉 consumer 容器會留下幽靈 member**（§2.4 的變形）：
+    SIGKILL 不會送 `LeaveGroup`，coordinator 要等 `session.timeout.ms`
+    （預設 45 秒）才把它踢掉。這段期間換上來的新容器**可能一個 partition
+    都分不到**，症狀是「健康檢查過、日誌無錯、但一則訊息都收不到」。
+    Phase 5 量 Java 記憶體下限時真的踩到：256m 與 384m 兩組都是 0% 收訊，
+    差點被當成「Java 在小記憶體下收不到訊息」寫進報告。
+    **換容器一律 `docker stop`（優雅）而不是 `docker rm -f`**，
+    連續實驗之間再等 5~50 秒。
+
+32. **`GOMEMLIMIT` 是軟上限：貼上去不會死，會變慢**（Phase 5 量到的）：
+    5000 條連線 + `--memory 128m` / `GOMEMLIMIT=100MiB` 時，RSS 到 96.6%，
+    GC 於是**持續**運行，扇出 p95 從 44.8ms 惡化到 **552ms**——
+    但**收訊率仍是 100%、零丟包**。換句話說失敗模式是「延遲被 GC 吃掉」，
+    不是 OOM（同樣情境 Java 是直接 OOMKilled）。
+    ⚠️ 這也表示 `deploy/docker-compose.yml` 那個 128M 只夠**約 1000 條**連線。
+    抓法：**每 1000 條連線約 25 MiB，再留一倍餘裕給 GC**。
+    調 `mem_limit` 時 `GOMEMLIMIT` 要一起調（見 §3「容器與部署」）。
+
 ---
 
 ## 3. 約定速查
@@ -262,6 +300,11 @@ module path `github.com/AlexChang1999/lucky-star-notify-go`，**Go 1.24+**。
   `log/slog`（標準庫，**不用第三方 logger**）
 - 已引入（Phase 3）：`segmentio/kafka-go`（**純 Go，可 `CGO_ENABLED=0` 靜態編譯**）
 - Phase 4 沒有新增任何 Go 依賴（容器化與 CI 都不需要）
+- Phase 5 新增的是**測試相依，不是服務相依**：`test/contract` 用 Node.js
+  （`@stomp/stompjs` + `kafkajs`，需 Node ≥ 22.4 的內建全域 `WebSocket`）；
+  `test/load` 完全重用既有的 Go 依賴。**服務本身的依賴一個都沒動。**
+  契約測試刻意用第三方 client 而不是自己寫——用自家 client 測自家 server，
+  證明的只是「我的兩份實作互相相容」，不是「與規格相容」。
 - **對外埠一覽**（全部刻意與團隊 repo 錯開，兩套才能同時跑做 A/B）：
 
   | 埠 | 用途 | 團隊 repo 的對應 |
@@ -310,6 +353,11 @@ module path `github.com/AlexChang1999/lucky-star-notify-go`，**Go 1.24+**。
   p95 推播延遲 **4.75 ms**。
 - `GOMEMLIMIT` 要與容器記憶體上限**成對設定**且略低於它（現為 100MiB／128M）——
   這是 Java 那條「`mem_limit` 與 `-Xmx` 要成對」在 Go 的對應物。
+  ⚠️ Phase 5 實測後補一句：**這一對數字要跟著預期連線數走**。
+  現在的 100MiB／128M 只夠約 **1000 條**連線；5000 條時 RSS 到上限的 96.6%，
+  GC 持續運行、扇出 p95 從 44.8ms 惡化到 552ms（服務不死、零丟包，
+  但延遲被吃掉）。抓法是**每 1000 條連線約 25 MiB，再留一倍餘裕給 GC**。
+  細節見地雷 §2.32 與 `docs/效能對照報告.md` §6。
 
 ### Git / 提交
 - **個人 repo，單人開發**：直接在 `main` 上做，不搞 fork/PR（團隊 repo 那套在這裡是純負擔）
@@ -378,6 +426,22 @@ docker compose -f deploy/docker-compose.yml --profile observability up -d
 # 收工。⚠️ 開過 observability 的話，down 也要帶同一個 --profile，
 # 否則那兩個容器會留著，網路刪不掉（"Resource is still in use"）
 docker compose -f deploy/docker-compose.yml --profile observability down -v
+```
+
+**跨語言契約測試與壓測（Phase 5）**：
+
+```bash
+# 契約測試（Node.js，同一份對兩個實作跑）。詳見 test/contract/README.md
+cd test/contract && npm ci
+CONTRACT_TARGET=go   npm test                      # 本 repo，8088
+CONTRACT_TARGET=java JWT_SECRET=<團隊那把> npm test  # 團隊 repo，8087
+
+# 壓測。⚠️ 一定要在容器網路裡跑，不要從宿主打（地雷 §2.30）
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o bin/load-linux ./test/load
+docker run --rm --network lucky-star-notify-go_default \
+  -v "$PWD/bin:/host:ro" -e JWT_SECRET=... alpine:3.22 \
+  /host/load-linux -target ws://notify-go:8088/ws -kafka kafka:9092 \
+  -conns 1000 -rounds 10 -hold 40s
 ```
 
 **看服務有沒有真的在消費**：`notify_kafka_messages_total` 是 CounterVec，
