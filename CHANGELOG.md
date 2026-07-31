@@ -5,6 +5,116 @@
 
 ---
 
+## [chore] — 2026-07-31 — 從團隊 repo 移植 subagent，6 個只留 2 個
+
+團隊 repo `H:\Lucky_Star_Casino\.claude\agents\` 有 6 個角色定義。
+逐份讀完後只移植 2 個，**且內容全部重寫**。
+
+**Added**
+- `.claude/agents/go-reviewer.md`——唯讀審查者（白名單刻意沒有 Edit/Write）。
+  審查優先序按本專案的實際風險排：① 併發正確性（§2.5/2.6/2.11/2.15/2.16）
+  ② **靜默失敗類**（§2.3/2.12/2.13/2.18/2.23——本專案的招牌 bug 類型，
+  沒有錯誤訊息只有「怎麼沒反應」，讀 code 找例外是抓不到的）
+  ③ 安全與跨語言等價 ④ 協議正確性 ⑤ 可維護性。
+  另外明列**「不准報成 bug 的刻意設計」**：JWT 不檢查 `type` claim（§2.14）、
+  不複製 Jackson 的字串轉型（§2.19）、關機每 topic 3 秒（§2.24，且
+  `HeartbeatInterval` 已試過無效、禁止再提）、錯開的埠號（§2.25）、
+  不准建議加 interface/factory（CLAUDE.md §2）。誤報這些會浪費時間又損信任。
+- `.claude/agents/go-tester.md`——只碰測試檔、發現產品 bug 只回報不修、不 commit。
+  含測試端專屬地雷（§2.17 client 也是一 reader、§2.27 背壓測試要交錯、
+  §2.28 `t.Fatalf` 只能在測試 goroutine），以及 Phase 5 兩項未完成 DoD 的作法。
+  特別指明 `test/contract/harness.js`（336 行）**已經存在且 export 齊全**，
+  要 import 它而不是另建一套。
+- `.claude/agents/README.md`——角色表、觸發詞表、流程、成本警告與逐項移植決策。
+
+**為什麼只留 2 個**
+那 6 份的 body 幾乎全是領域知識（Maven / JPA 雙資料源 / wallet 帳務 / RTP band /
+PixiJS / 三條下注鐵則），對本專案 100% 無效；可轉移的只有**結構紀律**。
+`dev-coder` 不留是因為 8,507 行、7 個 `internal/` 套件的規模，主執行緒直接做比
+冷啟動快；`devops` 不留除了 Phase 4 已完成，更因為那份寫著
+「never touch `main`: protected branch」，**與 AGENTS.md §3 的單人開發約定直接衝突**，
+照抄進來就是兩份打架的指令；`frontend-dev` / `ui-ux` 沒有對應領域。
+這與 `AGENTS.md §6` 對團隊 31 條地雷的判斷是同一個模式：能轉移的是紀律不是內容。
+
+**Changed**
+- `AGENTS.md` §3 新增「Subagent」小節：角色表 + **冷啟動成本警告**
+  （subagent 會自己重讀 AGENTS.md 28.9 KB + CLAUDE.md，每次約 9~10k token，
+  所以小改動一律主執行緒做）+ 地雷知識只維護在 §2 不要複製進 agent 檔案。
+
+**Fixed**
+- `AGENTS.md` §2.8 團隊 repo 路徑**寫錯**。原文說是雙層的
+  `D:\Lucky_Star_Casino\Lucky_Star_Casino\`、且「H: 磁碟機已經不存在」。
+  2026-07-31 實測相反：`H:\Lucky_Star_Casino\` 存在且是完整 git repo（HEAD `c427943`），
+  `D:\Lucky_Star_Casino\` 整個不存在。**這一行已經被改錯過兩次**，所以這次不只改值，
+  還加上「換機器路徑就會變，開工前先 `ls` 確認，別相信本行寫死的值」。
+
+**如何驗證**
+- 7 份團隊 agent 檔案逐份讀完後才做取捨，非抽樣
+- 路徑以 `ls` + `git log` 實測三個候選路徑確認（H: 單層有、D: 兩種都沒有）
+- `test/contract/harness.js` 的 exports 以 grep 核對過，agent 檔案裡列的
+  `mintToken` / `connect` / `connectExpectingRejection` / `createProducer` / `send` 均為實際存在
+- ⚠️ **agent 註冊本身尚未驗證**——Claude Code 要**重開 session** 才會載入新的
+  agent 定義，本次 session 內無法確認。重開後用 `/agents` 檢查
+
+## [feat] — 2026-07-31 — 跨語言契約測試完成：Java 版與 Go 版各 14/14 全綠
+
+Phase 5 最核心的 DoD 落地。任何人都能說「我用 Go 重寫了一個服務」，
+這一筆是**證明重寫出來的東西行為一樣**——而且是有證據的一樣。
+
+**Added**
+- `test/contract/contract.test.js`（312 行、**14 個案例**：9 個頂層 +
+  5 個迴圈產生的鑑權案例）。Node.js + `@stomp/stompjs` + `kafkajs`，
+  只吃 `WS_TARGET` / `KAFKA_BROKER` / `JWT_SECRET` 三個環境變數，
+  **測試碼裡沒有任何一行認得出對面是 Java 還是 Go**——只要出現一句
+  「如果是 Go 就……」，這份測試的證明力就沒了。
+  刻意不用 Go 寫：用 Go 的 client 測 Go 的 server 只能證明「我的兩份實作
+  互相相容」，用業界標準 client 測，證明的才是**與規格相容**。
+  涵蓋的重點是幾個**天生沒有錯誤訊息**的差異：`game.result` 推播不含
+  `playerId` 且 `type` 在第一個、`null` 欄位是「存在且為 null」而不是消失、
+  MESSAGE 帧一定帶 `subscription` 與 `message-id`、JSON 不做 HTML 轉義
+  （逐位元組比對，因為 `JSON.parse` 之後兩種寫法完全相同、抓不到）、
+  以及 `alg: none` 等五種爛憑證都必須回 ERROR **並斷線**。
+- `test/contract/harness.js`（336 行）與 `README.md`：共用底座，
+  export `mintToken` / `connect` / `connectExpectingRejection` /
+  `createProducer` / `send` 與各 `DEST_*`、`TOPIC_*` 常數。
+- CI（`compose 煙霧測試` job）新增 Go 版契約測試步驟，釘住等價性不會
+  因為之後某次改動而**無聲失效**。刻意排在「確認真的消費到 Kafka 訊息」
+  **之後**——那一步是 consumer 已完成 rebalance 的證據，少了它，契約測試
+  會在冷啟動期間逾時，而失敗訊息會指向推播壞掉，完全查錯方向。
+  Java 版那一組沒進 CI：那需要團隊 repo 的原始碼，本 repo 對它唯讀（§2.8）。
+- Kafka 新增 `HOST` listener（容器內 9094，對外 `9094:9094`），
+  因為契約測試與壓測都從**宿主**發事件。
+  advertised listener 變成兩條：`PLAINTEXT://kafka:9092` 給 compose 網路內的
+  notify-go 與 demo、`HOST://localhost:9094` 給宿主上的 client。
+  **只有一條時，宿主的 client bootstrap 連得上、但拿到的位址是 `kafka:9092`，
+  之後每個請求都逾時，錯誤訊息完全指不到這裡**；反過來只寫 localhost，
+  則換成容器內的 client 去連自己的 127.0.0.1。
+- `test/contract/harness.js`（336 行）與 `package.json`：契約測試的共用底座，
+  export `mintToken` / `connect` / `connectExpectingRejection` / `createProducer` / `send`
+  與各 `DEST_*`、`TOPIC_*` 常數。目標由 `WS_TARGET` 切換，
+  Go 版走 `localhost:9094`、Java 版走團隊那套的 `localhost:9092`。
+
+**Changed**
+- `KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT` 必須明寫——有兩個 PLAINTEXT
+  安全協定的 listener 時 broker 無法自己判斷該用哪個，**不寫會啟動失敗**
+  （單節點其實用不到 broker 間通訊）。
+- 埠選 **9094 而不是 9092**：團隊 repo 的 `lucky-star-kafka` 占著宿主 9092，
+  兩套要能同時跑才做得成 A/B 對照（同 8088 vs 8087 的理由）。
+  已補進 `AGENTS.md` §3 的對外埠一覽表。
+- `.gitattributes` 把 `*.js` 也納入 LF 正規化（契約測試是 Node.js 寫的）。
+- `.gitignore` 忽略 `/test/contract/node_modules/`，但
+  **`package-lock.json` 要進版控**——契約測試的價值來自可重現，
+  「`@stomp/stompjs` 換版本後行為變了」正是最不該混進來的變數。
+- `計畫說明書.md` §6 勾掉 Phase 5 第一項 DoD。
+
+**如何驗證**
+- 2026-07-31 實測：同一份測試對 **Java 版（8087）與 Go 版（8088）各 14/14 全綠**。
+- **Java 版是第一次跑就過**，沒有為了配合它改過任何一條斷言。這正是
+  `計畫說明書.md` §7 規定「先對 Java 版跑通再寫 Go 版」那個順序的回報：
+  測試本身的正確性先被驗證過，之後 Go 版若失敗就能確定是 Go 寫錯了。
+- 跑法：`cd test/contract && npm ci && CONTRACT_TARGET=go npm test`
+  （Java 版把 `CONTRACT_TARGET` 換成 `java`）。
+
 ## [fix] — 2026-07-30 — CI 第一次實跑抓到的三件事
 
 CI 在 PR #2 上第一次執行。`建置映像` 過（含映像大小斷言），

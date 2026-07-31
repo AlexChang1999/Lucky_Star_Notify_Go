@@ -75,8 +75,12 @@ module path `github.com/AlexChang1999/lucky-star-notify-go`，**Go 1.24+**。
    **必須在報告裡標明是 co-located，且不可當作對外可引用的容量上限**。
 
 8. **不動團隊 repo**：團隊 repo 對本專案是**唯讀參考**。
-   實際路徑是 **`D:\Lucky_Star_Casino\Lucky_Star_Casino\`**（注意是**雙層**同名資料夾，
-   `backend/` 在內層）。本檔原本寫 `H:\Lucky_Star_Casino`，那個磁碟機已經不存在了。
+   實際路徑是 **`H:\Lucky_Star_Casino\`**（單層，`backend/` 直接在底下）。
+   ⚠️ **這一行已經被改錯過兩次**：先寫 `H:\`、改成雙層的
+   `D:\Lucky_Star_Casino\Lucky_Star_Casino\`（宣稱 H: 磁碟不存在）、實測後又回到 H: 單層。
+   結論是**換機器時這個路徑會變，不要相信本行寫死的值——開工前先 `ls` 確認**。
+   2026-07-31 實測：`H:\Lucky_Star_Casino\` 是完整 git repo（HEAD `c427943`），
+   `D:\Lucky_Star_Casino\` 整個不存在。
    需要驗證行為時可以在本機把它跑起來、可以改本機 `.env`，
    但**不提交任何 commit、不開 PR**。所有產出都留在本資料夾。
    關鍵檔案索引見 `計畫說明書.md` 附錄 A。
@@ -264,6 +268,7 @@ module path `github.com/AlexChang1999/lucky-star-notify-go`，**Go 1.24+**。
   |---|---|---|
   | **8088** | notify-go | Java 版 8087 |
   | **8090** | demo 頁面 + dev token 端點（`cmd/demo`，**不是服務的一部分**） | — |
+  | **9094** | Kafka 的 `HOST` listener（給宿主上的契約測試／壓測／CLI 用） | 9092 |
   | **9091** | Prometheus（`observability` profile） | 9090 |
   | **3001** | Grafana（`observability` profile） | 3000 |
 - 對外端點：`/ws`（WebSocket）、`/actuator/health`、`/metrics` 與 `/actuator/prometheus`（同一個 handler 註冊兩次，方便接團隊的 Prometheus）、
@@ -321,6 +326,23 @@ module path `github.com/AlexChang1999/lucky-star-notify-go`，**Go 1.24+**。
   - `ADR-001` 為什麼用 Go 重寫推播服務
   - `ADR-002` STOMP 子集的取捨（做哪些指令、為何不做 SockJS）
   - 未來工作要寫進 ADR-001：**多副本的連線路由問題**（Java 版同樣未解，見 `計畫說明書.md` §3.3 發現 3）
+
+### Subagent（`.claude/agents/`）
+只有**兩個**角色，明細與決策理由見 `.claude/agents/README.md`：
+
+| 角色 | 職責 | 關鍵限制 |
+|---|---|---|
+| `go-reviewer` | 對照本檔 §2 的 28 條地雷審查 diff | **唯讀**，白名單沒有 Edit/Write |
+| `go-tester` | Go 單元測試、`test/contract/` 契約測試、`test/load/` 壓測 | 只碰測試檔、不 commit |
+
+團隊 repo 那 6 個角色**只移植了 2 個**——其餘 4 個的內容是 Java/Spring/PixiJS 專屬，
+且 `devops` 那份的「never touch `main`」與本檔上面的單人開發約定直接衝突。
+
+⚠️ **冷啟動成本**：subagent 會自己重讀本檔（28.9 KB）+ `CLAUDE.md`，
+每次約 9~10k token。**小改動、單檔修正、問問題一律主執行緒直接做**；
+只有雜訊大、要來回試錯的工作（Phase 5 的契約測試與壓測）才值得派。
+地雷知識**只維護在本檔 §2**，不要複製進 agent 檔案（會漂移）。
+改完 agent 檔案要**重開 session** 才註冊。
 
 ---
 

@@ -25,5 +25,10 @@ coverage.html
 *.swp
 .DS_Store
 
+# ── 契約測試（Node.js）──
+# package-lock.json **要**進版控：契約測試的價值來自可重現，
+# 而「@stomp/stompjs 換版本後行為變了」正是最不該混進來的變數。
+/test/contract/node_modules/
+
 # ── 壓測與報告的原始輸出（報告本身要 commit，原始檔不用）──
 /test/load/results/

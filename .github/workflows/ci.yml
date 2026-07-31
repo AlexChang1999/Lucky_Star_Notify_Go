@@ -164,6 +164,32 @@ jobs:
           echo "::error::90 秒內沒有成功消費任何 Kafka 訊息"
           exit 1
 
+      - uses: actions/setup-node@v6
+        with:
+          # 契約測試用的是 Node 內建的全域 WebSocket（22.4 起穩定），
+          # 所以不必額外裝 ws。指定版本而不是吃 runner 預設，
+          # 是為了不讓「runner 換了 Node 版本」變成 CI 紅掉的原因。
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: test/contract/package-lock.json
+
+      - name: 跨語言契約測試（Go 版）
+        # 這一步跑的是 test/contract/ 那份**與語言無關**的測試，
+        # 也就是本專案「Go 版與 Java 版行為等價」這個主張的證據。
+        # Java 版那一組沒辦法在 CI 跑（需要團隊 repo 的原始碼，
+        # 而本 repo 對它是唯讀參考），但把 Go 這一側釘在 CI 裡，
+        # 至少保證等價性不會因為之後某次改動而**無聲失效**。
+        #
+        # 放在「確認真的消費到 Kafka 訊息」之後不是隨意排的：那一步是
+        # consumer 已經完成 rebalance 的證據，少了它，契約測試會在冷啟動
+        # 期間逾時，而失敗訊息會指向推播壞掉——完全查錯方向。
+        working-directory: test/contract
+        env:
+          CONTRACT_TARGET: go
+        run: |
+          npm ci
+          npm test
+
       - name: 失敗時印出容器日誌
         # if: failure() 讓這一步只在前面掛掉時執行。
         # 沒有它，CI 紅了卻只看得到一句 curl 失敗，查不出原因。

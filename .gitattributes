@@ -21,8 +21,11 @@ Dockerfile     text eol=lf
 # 但成因完全不同，會查錯方向）。
 .env.example   text eol=lf
 
-# Grafana dashboard 等設定檔。
+# Grafana dashboard 等設定檔，以及契約測試的 package.json / package-lock.json。
 *.json   text eol=lf
+
+# 契約測試（test/contract）是 Node.js 寫的。
+*.js     text eol=lf
 
 # ⚠️ cmd/demo/index.html 是用 go:embed **編進執行檔**的。
 # 讓 Windows checkout 把它轉成 CRLF，等於同一份原始碼在不同平台編出

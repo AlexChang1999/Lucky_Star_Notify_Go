@@ -1,0 +1,17 @@
+{
+  "name": "lucky-star-notify-contract",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "跨語言黑箱契約測試：同一份測試對 Java 版（8087）與 Go 版（8088）都要通過",
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22.4.0"
+  },
+  "dependencies": {
+    "@stomp/stompjs": "^7.1.1",
+    "kafkajs": "^2.2.4"
+  }
+}
