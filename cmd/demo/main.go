@@ -159,6 +159,14 @@ func run() error {
 		// topic 不存在而失敗，使用者得手動跑 kafka-topics.sh——
 		// 那就不叫「clone 完直接跑起來」了。
 		AllowAutoTopicCreation: true,
+		// ⚠️ kafka-go 的 BatchTimeout **預設是 1 秒**（BatchSize 預設 100）。
+		// 這個產生器每次只寫一則，於是每一則都會在 producer 端整整壓一秒
+		// 才送出——demo 頁面上看到的「即時推播」因此無端慢一秒，
+		// 而且日誌與指標都看不出來（`notify_push_latency_seconds` 量的是
+		// Kafka 訊息時間戳之後的事，這一秒發生在它之前）。
+		// 一則一批就立刻送出。Phase 5 做扇出延遲量測時才發現這件事。
+		BatchSize:    1,
+		BatchTimeout: 5 * time.Millisecond,
 	}
 	defer func() {
 		if err := writer.Close(); err != nil {
