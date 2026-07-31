@@ -407,7 +407,23 @@ curl -s localhost:8088/actuator/prometheus | grep notify_kafka_messages_total
   # gcc 的安裝位置「絕對不能含空白」，見地雷 §2.22
   winget install -e --id BrechtSanders.WinLibs.POSIX.UCRT --location "C:\toolchains\winlibs"
   go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+  # gopls 本身 + 它內建的 MCP server（見下）
+  go install golang.org/x/tools/gopls@latest
+  claude mcp add gopls -- gopls mcp
   ```
+- **gopls MCP**（實測 2026-07-31，gopls v0.23.0）：Go 團隊官方維護、v0.20 起內建，
+  不需要第三方 binary。讓 AI 用**編譯器等級的符號解析**取代 grep，
+  對本專案的成對關係（例如地雷 §2.13 的 `serverHeartbeatSend` ↔ `writeLoop` ticker）
+  比字串搜尋可靠。工具有 `go_workspace` / `go_diagnostics` / `go_references` /
+  `go_symbol_references` / `go_package_api` / `go_vulncheck` 等。
+  ⚠️ 官方標示 **experimental**；它會執行 `go` 指令並連 proxy.golang.org。
+  ⚠️ **註冊資訊寫在 `~/.claude.json` 而不是本 repo**，所以 clone 到新機器不會跟著來，
+  必須重跑上面那行 `claude mcp add`。裝完 `claude mcp list` 應顯示 `✔ Connected`。
+  刻意用 local scope（只在本專案生效）——MCP 的工具定義每次都佔 context，
+  裝在全域等於在非 Go 專案裡也付這筆錢。
+  **刻意不裝的**：k6 之類的壓測 MCP（`計畫說明書.md` §7 明訂壓測工具要用 Go 自己寫，
+  那正是展示重點）、泛用 Go skill 包（教的通用慣例與 `CLAUDE.md` §2
+  「沒有兩個實作就不要有 interface」直接衝突，且會抵銷 §0 的 hints-before-answers）。
 - Go 與 gcc 都**不在**預設 PATH（而且 Claude Code 起的子行程拿到的是舊 PATH
   快照，安裝後也不會自動更新），跑指令前要自己補：
   ```powershell

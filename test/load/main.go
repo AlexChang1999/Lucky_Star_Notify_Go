@@ -31,6 +31,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -279,7 +281,7 @@ func report(o options, clients []*client, elapsed time.Duration) int {
 	failures := map[string]int{}
 	for _, c := range clients {
 		if c.err != nil {
-			failures[c.err.Error()]++
+			failures[c.failureKey()]++
 			continue
 		}
 		connected++
@@ -290,10 +292,28 @@ func report(o options, clients []*client, elapsed time.Duration) int {
 	fmt.Printf("  連線數      %d（成功 %d / 失敗 %d）\n", o.conns, connected, o.conns-connected)
 	fmt.Printf("  建立耗時    %s（設定速率 %d/s）\n", elapsed.Round(time.Millisecond), o.rate)
 	fmt.Printf("  握手延遲    %s\n", summarize(handshake))
-	for msg, n := range failures {
-		fmt.Printf("  ✗ %d 條：%s\n", n, msg)
-	}
+	printFailures(failures)
 	return connected
+}
+
+// printFailures 依數量由多到少列出失敗原因。
+//
+// map 的走訪順序在 Go 是刻意隨機的，直接印會讓同一場壓測跑兩次的輸出
+// 順序不同——比對兩份報告時很煩。排序不是美觀問題。
+func printFailures(failures map[string]int) {
+	keys := make([]string, 0, len(failures))
+	for key := range failures {
+		keys = append(keys, key)
+	}
+	slices.SortFunc(keys, func(a, b string) int {
+		if d := failures[b] - failures[a]; d != 0 {
+			return d
+		}
+		return strings.Compare(a, b)
+	})
+	for _, key := range keys {
+		fmt.Printf("  ✗ %d 條：%s\n", failures[key], key)
+	}
 }
 
 func reportFanout(o options, clients []*client, connected int) summary {
@@ -318,20 +338,19 @@ func reportFanout(o options, clients []*client, connected int) summary {
 // 存的是**摘要加上全部原始樣本**，不是只有百分位數：報告寫完之後若想換一組
 // 百分位、或畫個分佈圖，不必重跑一次壓測。
 type jsonReport struct {
-	Target         string        `json:"target"`
-	Kafka          string        `json:"kafka"`
-	Conns          int           `json:"conns"`
-	Connected      int           `json:"connected"`
-	Rate           int           `json:"rate"`
-	Rounds         int           `json:"rounds"`
-	IntervalMS     int64         `json:"intervalMs"`
-	ConnectElapsed string        `json:"connectElapsed"`
-	Handshake      summary       `json:"handshake"`
-	Fanout         summary       `json:"fanout"`
-	FanoutSamples  []int64       `json:"fanoutSamplesNs"`
-	HandshakeNs    []int64       `json:"handshakeSamplesNs"`
-	RecordedAt     time.Time     `json:"recordedAt"`
-	Elapsed        time.Duration `json:"-"`
+	Target         string    `json:"target"`
+	Kafka          string    `json:"kafka"`
+	Conns          int       `json:"conns"`
+	Connected      int       `json:"connected"`
+	Rate           int       `json:"rate"`
+	Rounds         int       `json:"rounds"`
+	IntervalMS     int64     `json:"intervalMs"`
+	ConnectElapsed string    `json:"connectElapsed"`
+	Handshake      summary   `json:"handshake"`
+	Fanout         summary   `json:"fanout"`
+	FanoutSamples  []int64   `json:"fanoutSamplesNs"`
+	HandshakeNs    []int64   `json:"handshakeSamplesNs"`
+	RecordedAt     time.Time `json:"recordedAt"`
 }
 
 func writeJSON(o options, clients []*client, connectElapsed time.Duration, fanout summary) error {
