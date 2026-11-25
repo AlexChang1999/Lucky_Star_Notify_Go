@@ -63,9 +63,7 @@ services:
     deploy:
       resources:
         limits:
-          # 對照組：團隊 repo 的 notification-service 是 mem_limit 1280m
-          # 搭 -Xmx1g。十分之一是這個專案最直觀的賣點之一，
-          # 但**數字要實測**（docker stats）才能寫進報告（AGENTS.md §2.7）。
+          # 容器記憶體上限；GOMEMLIMIT（見上方 environment）要設得比它低一截。
           memory: 128M
 
 networks:

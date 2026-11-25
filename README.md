@@ -5,13 +5,12 @@
 **消費 Kafka 事件，透過 WebSocket / STOMP 即時推播給線上玩家。**
 把一個 Java 21 / Spring Boot 3.3.5 的服務用 Go 重寫，並**證明兩個實作行為等價**。
 
-這個專案想證明的不是「我會用 Go 寫 CRUD」，而是三件事：
+這個專案想證明的不是「我會用 Go 寫 CRUD」，而是兩件事：
 
 | | |
 |---|---|
 | 🔌 **協議層自己寫得出來** | Go 生態沒有現成的 STOMP **伺服器**實作。`internal/stomp` 照 1.2 規格自己刻，**零外部依賴**，含 header 轉義、心跳協商與模糊測試 |
 | 🤝 **兩個實作真的等價** | 一份與語言無關的黑箱契約測試，對 Java 版（8087）與 Go 版（8088）**各 14/14 全綠** |
-| 📉 **效能有實測不是宣稱** | 映像 27× 小、冷啟動 16× 快、閒置記憶體 28× 少、5000 連線握手 p99 89× 好——**以及 Go 沒有比較快的那一項也照實寫** |
 
 > 原版是我大專小組專案 `Lucky_Star_Casino` 的 `notification-service`。
 > 本 repo **獨立、可單獨運行**，不需要拿到團隊 repo。
@@ -30,7 +29,7 @@ flowchart LR
 
   K[("Kafka<br/>notification.push<br/>game.result<br/>rank.update")]
 
-  subgraph svc["notify-go　單一靜態執行檔　18.6 MB"]
+  subgraph svc["notify-go　單一靜態執行檔"]
     C["consumer<br/>3 topic × 1 goroutine"]
     H["hub<br/>RWMutex 保護的連線註冊表<br/>每連線 2 goroutine（一讀一寫）"]
     S["internal/stomp<br/>STOMP 1.2 編解碼（自幹）"]
@@ -67,8 +66,7 @@ docker compose -f deploy/docker-compose.yml up --build -d --wait
 
 打開 **<http://localhost:8090>** ——自帶的假上游每 3 秒發一則事件，
 頁面用業界標準的 `@stomp/stompjs` 連上 `:8088`，訊息會即時跳出來。
-**不需要團隊 repo，不需要裝 Go。** 實測冷啟動到全部 healthy 約 40 秒
-（絕大部分是等 Kafka；notify-go 自己從容器啟動到服務就緒是 **230 ms**）。
+**不需要團隊 repo，不需要裝 Go。** 啟動時間主要花在等 Kafka 就緒。
 
 開兩個分頁、各自選不同玩家，可以看到私人推播只進正確的那一個。
 
@@ -116,40 +114,6 @@ JSON 不做 HTML 轉義（Go 的 `encoding/json` 預設會轉、Jackson 不會�
 逐項說明見 [`test/contract/README.md`](test/contract/README.md)。
 
 Go 這一側**跑在 CI 裡**，所以等價性不會因為之後某次改動而無聲失效。
-
----
-
-## 效能對照（實測，非宣稱）
-
-完整方法、原始數字與**所有誠實聲明**見 [`docs/效能對照報告.md`](docs/效能對照報告.md)。
-
-| 指標 | Go 版 | Java 版 | |
-|---|---:|---:|---|
-| 映像大小 | **18.6 MB** | 502 MB | 27× |
-| 冷啟動（到健康檢查回 200） | **301 ms** | 4 791 ms | 16× |
-| 閒置記憶體 | **7.6 MiB** | 218.1 MiB | 28× |
-| 5 000 連線時的記憶體 | **188 MiB** | 969.6 MiB | 5.2× |
-| 5 000 連線握手 p99 | **12.7 ms** | 1 131.5 ms | **89×** |
-| 5 000 連線扇出 p50 | **25.0 ms** | 28.9 ms | 1.15× |
-
-> **最後一行才是重點。** 在記憶體充足時，兩邊的扇出延遲**同一個數量級**——
-> **Go 並沒有快一個數量級**。真正的差距在「每條連線的成本」與「最壞情況的可預測性」，
-> 不在吞吐量。報告裡另外列了一整節「這份報告**沒有**證明的事」。
-
-報告裡三個比原訂目標更有價值的發現：
-
-- **不能從宿主施壓。** Docker Desktop 的埠轉發在 5000 條時把 3011 條 reset 掉
-  （連壓測程式對 Kafka 的連線也一起）。改成在容器網路內施壓後全通，
-  而且握手 p50 從 8.35 ms 變 **0.86 ms**——原本量到的根本是轉發層。
-- **`GOMEMLIMIT` 是軟上限。** 128 MB 下跑 5000 條，服務**不死、零丟包**，
-  但 GC 持續運行，扇出 p95 從 44.8 ms 惡化到 552 ms。
-  失敗模式是「延遲被 GC 吃掉」——與 Java 在同樣情況直接 OOMKilled 是不同的性質。
-- **JVM 的 RSS 是高水位線。** 跑完 5000 條再降回 100 條，Java 仍佔 1 018 MiB。
-  另外 JIT 暖機讓冷容器的第一批連線慢 **620×**（873 ms → 1.41 ms）；Go 冷熱一樣。
-
-施壓工具是 [`test/load`](test/load/README.md)——**用 Go 寫壓測工具本身就是展示**：
-5000 條長連線就是 5000 個 goroutine，每個用最直觀的阻塞式 `for { ReadMessage }`，
-沒有 callback、沒有 event loop。
 
 ---
 
@@ -215,7 +179,7 @@ CI（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）跑三個 job：
 | `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | 明確給空字串 = 不啟動 consumer |
 | `KAFKA_GROUP_ID` | `notification-service-go-group` | **必須與 Java 版不同**，否則兩邊會搶 partition |
 | `DEBUG_PUSH` | `true` | ⚠️ 這個端點**沒有鑑權**，接上 Kafka 或任何對外部署都必須設 `false` |
-| `GOMEMLIMIT` | — | 與容器記憶體上限成對設定；每 1000 條連線約抓 25 MiB |
+| `GOMEMLIMIT` | — | 與容器記憶體上限成對設定 |
 
 缺必填或值不合法**一律拒絕啟動**，而且一次回報所有問題。
 
@@ -239,7 +203,7 @@ CI（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）跑三個 job：
 | 2 | Hub / 訂閱 / 推播 / 心跳 / 背壓 | ✅ |
 | 3 | Kafka 三個 consumer | ✅ |
 | 4 | 容器化 / 觀測性 / 獨立 compose / CI | ✅ |
-| 5 | 契約測試 / 效能對照 / ADR / README | ✅ |
+| 5 | 契約測試 / ADR / README | ✅ |
 
 Phase 0 唯一沒打勾的是「登入 → 玩一局 → 收到 `GAME_RESULT`」這條**完整**端到端路徑，
 它需要整套團隊 stack（gateway + member + game + Kafka）。

@@ -164,7 +164,7 @@ func run() error {
 		// 才送出——demo 頁面上看到的「即時推播」因此無端慢一秒，
 		// 而且日誌與指標都看不出來（`notify_push_latency_seconds` 量的是
 		// Kafka 訊息時間戳之後的事，這一秒發生在它之前）。
-		// 一則一批就立刻送出。Phase 5 做扇出延遲量測時才發現這件事。
+		// 一則一批就立刻送出。
 		BatchSize:    1,
 		BatchTimeout: 5 * time.Millisecond,
 	}

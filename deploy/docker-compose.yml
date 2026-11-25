@@ -139,9 +139,7 @@ services:
     deploy:
       resources:
         limits:
-          # 128 MB。Java 版對照組是 mem_limit 1280m + -Xmx1g，
-          # 也就是十倍。這個數字是 Phase 5 效能對照報告的素材之一，
-          # 實際用量要用 docker stats 量出來再寫進報告。
+          # 容器記憶體上限；GOMEMLIMIT（見上方 environment）要設得比它低一截。
           memory: 128M
 
   # ── 假上游 + demo 頁面（開發用，不是產品的一部分）────────────────

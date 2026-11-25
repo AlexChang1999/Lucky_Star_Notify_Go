@@ -70,9 +70,9 @@ module path `github.com/AlexChang1999/lucky-star-notify-go`，**Go 1.24+**。
    滿了就斷線（fail-fast 背壓），並且要有 `notify_outbound_dropped_total` 計數器讓它可觀測。
 
 7. **效能數字一律實測，不可虛構**（沿用團隊專案的鐵則）：
-   `docs/效能對照報告.md` 的每個數字都必須有對應的實測輸出。
+   沒有親自跑過、沒有對應實測輸出的數字，不要寫進任何文件。
    同機施壓（施壓端與被測服務同一台）會被施壓端自身 CPU 污染，
-   **必須在報告裡標明是 co-located，且不可當作對外可引用的容量上限**。
+   **必須標明是 co-located，且不可當作對外可引用的容量上限**。
 
 8. **不動團隊 repo**：團隊 repo 對本專案是**唯讀參考**。
    實際路徑是 **`H:\Lucky_Star_Casino\`**（單層，`backend/` 直接在底下）。
@@ -209,7 +209,7 @@ module path `github.com/AlexChang1999/lucky-star-notify-go`，**Go 1.24+**。
 24. **關機時間 ≈ topic 數 × 3 秒，且改不掉**：三個 topic 是**同一個 consumer
     group 的三個 member**，coordinator 一次只處理一個 `LeaveGroup`、每次跑一輪
     rebalance，所以它們是排隊離開的（即使我們這邊三條 goroutine 是並行關的）。
-    實測收工時間恰好每 **3.000 秒**一個，牆鐘 6.5~8.7 秒。
+    實測收工時間恰好每 **3.000 秒**一個。
     ⚠️ **試過的無效解法**：懷疑是 kafka-go 的 `HeartbeatInterval`（預設剛好
     3 秒），改成 1 秒後**間隔仍是 3.000 秒**，假設不成立，已還原。別再試一次。
     所以 `shutdownTimeout` 是 10 秒（原訂 5 秒不夠），compose 要配
@@ -255,38 +255,25 @@ module path `github.com/AlexChang1999/lucky-star-notify-go`，**Go 1.24+**。
     `cmd/demo` 每 3 秒發一則，於是 demo 頁上的「即時推播」無端慢一秒，
     而且**日誌與指標都看不出來**——`notify_push_latency_seconds` 量的是
     Kafka 訊息時間戳之後的事，這一秒發生在它之前。
-    做 Phase 5 的扇出延遲量測時才發現（壓測用事件裡的 `updatedAt` 算延遲，
-    那一秒會**整個算進去**，p50 直接變成 1 秒出頭，看起來像伺服器很慢）。
+    （若用事件裡的 `updatedAt` 算延遲，那一秒會**整個算進去**，看起來像伺服器很慢。）
     ⚠️ **任何低頻、單則寫入的 writer 都要設 `BatchSize: 1`**。
-    已修：`cmd/demo` 與 `test/load`。
+    已修：`cmd/demo`。
 
-30. **⭐ 在 Docker Desktop 上，壓測不能從宿主打**（Phase 5 實測）：
-    5000 條連線從宿主連進容器，**3011 條在 dial 階段被 reset**
-    （`An existing connection was forcibly closed by the remote host`），
-    而且**壓測程式自己對 Kafka 的連線也一起被 reset**——那是另一個容器、
-    另一個埠。兩件事同時失敗，指向共同的上游：**宿主的埠轉發層**，
-    而不是被測服務。改成把施壓端放進 compose 網路（`docker run --network ...`
-    掛一個 Linux 版執行檔）之後，5000 條**全部連上、一則不漏**。
-    順帶：網內握手 p50 是 **0.86ms**，經宿主轉發是 **8.35ms**——
-    近十倍的差距全是轉發層的成本，量到的根本不是服務。
+30. **在 Docker Desktop 上，大量連線的壓測不要從宿主打**：
+    宿主的埠轉發層可能成為瓶頸，量到的會是轉發層而不是被測服務。
+    施壓端應放進 compose 網路（`docker run --network ...`）。
 
 31. **`docker rm -f` 殺掉 consumer 容器會留下幽靈 member**（§2.4 的變形）：
     SIGKILL 不會送 `LeaveGroup`，coordinator 要等 `session.timeout.ms`
     （預設 45 秒）才把它踢掉。這段期間換上來的新容器**可能一個 partition
     都分不到**，症狀是「健康檢查過、日誌無錯、但一則訊息都收不到」。
-    Phase 5 量 Java 記憶體下限時真的踩到：256m 與 384m 兩組都是 0% 收訊，
-    差點被當成「Java 在小記憶體下收不到訊息」寫進報告。
     **換容器一律 `docker stop`（優雅）而不是 `docker rm -f`**，
     連續實驗之間再等 5~50 秒。
 
-32. **`GOMEMLIMIT` 是軟上限：貼上去不會死，會變慢**（Phase 5 量到的）：
-    5000 條連線 + `--memory 128m` / `GOMEMLIMIT=100MiB` 時，RSS 到 96.6%，
-    GC 於是**持續**運行，扇出 p95 從 44.8ms 惡化到 **552ms**——
-    但**收訊率仍是 100%、零丟包**。換句話說失敗模式是「延遲被 GC 吃掉」，
-    不是 OOM（同樣情境 Java 是直接 OOMKilled）。
-    ⚠️ 這也表示 `deploy/docker-compose.yml` 那個 128M 只夠**約 1000 條**連線。
-    抓法：**每 1000 條連線約 25 MiB，再留一倍餘裕給 GC**。
-    調 `mem_limit` 時 `GOMEMLIMIT` 要一起調（見 §3「容器與部署」）。
+32. **`GOMEMLIMIT` 是軟上限：貼上去不會 OOM，但 GC 會更積極、延遲變差**：
+    記憶體貼近上限時，失敗模式是「延遲被 GC 吃掉」而不是直接被殺。
+    ⚠️ `deploy/docker-compose.yml` 的記憶體上限是依預期連線數設的，
+    連線數預期上調時，`mem_limit` 與 `GOMEMLIMIT` 要一起調（見 §3「容器與部署」）。
 
 ---
 
@@ -302,7 +289,7 @@ module path `github.com/AlexChang1999/lucky-star-notify-go`，**Go 1.24+**。
 - Phase 4 沒有新增任何 Go 依賴（容器化與 CI 都不需要）
 - Phase 5 新增的是**測試相依，不是服務相依**：`test/contract` 用 Node.js
   （`@stomp/stompjs` + `kafkajs`，需 Node ≥ 22.4 的內建全域 `WebSocket`）；
-  `test/load` 完全重用既有的 Go 依賴。**服務本身的依賴一個都沒動。**
+  **服務本身的依賴一個都沒動。**
   契約測試刻意用第三方 client 而不是自己寫——用自家 client 測自家 server，
   證明的只是「我的兩份實作互相相容」，不是「與規格相容」。
 - **對外埠一覽**（全部刻意與團隊 repo 錯開，兩套才能同時跑做 A/B）：
@@ -311,7 +298,7 @@ module path `github.com/AlexChang1999/lucky-star-notify-go`，**Go 1.24+**。
   |---|---|---|
   | **8088** | notify-go | Java 版 8087 |
   | **8090** | demo 頁面 + dev token 端點（`cmd/demo`，**不是服務的一部分**） | — |
-  | **9094** | Kafka 的 `HOST` listener（給宿主上的契約測試／壓測／CLI 用） | 9092 |
+  | **9094** | Kafka 的 `HOST` listener（給宿主上的契約測試／CLI 用） | 9092 |
   | **9091** | Prometheus（`observability` profile） | 9090 |
   | **3001** | Grafana（`observability` profile） | 3000 |
 - 對外端點：`/ws`（WebSocket）、`/actuator/health`、`/metrics` 與 `/actuator/prometheus`（同一個 handler 註冊兩次，方便接團隊的 Prometheus）、
@@ -341,23 +328,16 @@ module path `github.com/AlexChang1999/lucky-star-notify-go`，**Go 1.24+**。
   - `cmd/notify` → 正式服務。`docker build .` 蓋出來的就是它。
   - `cmd/demo` → **開發用**假上游：產生假事件、服務 demo 頁、**簽發 JWT**。
     ⚠️ 簽章能力只能存在於這裡。正式映像裡沒有這段程式碼，就不可能被誤開。
-- base image 是 **`scratch`**，不是計畫書原訂的 distroless（那個實測 23.7 MB
-  超過 20 MB 的 DoD；差額幾乎全是用不到的 tzdata）。改用 scratch 就得自己補回：
+- base image 是 **`scratch`**，不是計畫書原訂的 distroless（它帶了不少用不到的
+  tzdata 等檔案，不利於 20 MB 的 DoD）。改用 scratch 就得自己補回：
   CA 憑證（從建置階段 COPY）、**數字 UID `65532:65532`**（沒有 /etc/passwd
   就不能寫 `USER nonroot`，寫了容器起不來）。時區資料刻意不補。
 - 沒有 shell 的兩個後果：`docker exec ... sh` 進不去；`HEALTHCHECK CMD curl`
   用不了——所以探針是執行檔自己的 **`/app -healthcheck`** 旗標
   （compose 用 `test: ["CMD", "/app", "-healthcheck"]`，**不能用 CMD-SHELL**）。
-- 實測數字（2026-07-30，第二台機器）：映像 **18.6 MB**（`docker images`）／
-  5.29 MB（pull 下載量）；服務啟動 **230 ms**；閒置記憶體 **12.9 MiB**／128 MiB 上限；
-  p95 推播延遲 **4.75 ms**。
 - `GOMEMLIMIT` 要與容器記憶體上限**成對設定**且略低於它（現為 100MiB／128M）——
   這是 Java 那條「`mem_limit` 與 `-Xmx` 要成對」在 Go 的對應物。
-  ⚠️ Phase 5 實測後補一句：**這一對數字要跟著預期連線數走**。
-  現在的 100MiB／128M 只夠約 **1000 條**連線；5000 條時 RSS 到上限的 96.6%，
-  GC 持續運行、扇出 p95 從 44.8ms 惡化到 552ms（服務不死、零丟包，
-  但延遲被吃掉）。抓法是**每 1000 條連線約 25 MiB，再留一倍餘裕給 GC**。
-  細節見地雷 §2.32 與 `docs/效能對照報告.md` §6。
+  ⚠️ **這一對數字要跟著預期連線數走**，細節見地雷 §2.32。
 
 ### Git / 提交
 - **個人 repo，單人開發**：直接在 `main` 上做，不搞 fork/PR（團隊 repo 那套在這裡是純負擔）
@@ -381,14 +361,14 @@ module path `github.com/AlexChang1999/lucky-star-notify-go`，**Go 1.24+**。
 | 角色 | 職責 | 關鍵限制 |
 |---|---|---|
 | `go-reviewer` | 對照本檔 §2 的 28 條地雷審查 diff | **唯讀**，白名單沒有 Edit/Write |
-| `go-tester` | Go 單元測試、`test/contract/` 契約測試、`test/load/` 壓測 | 只碰測試檔、不 commit |
+| `go-tester` | Go 單元測試、`test/contract/` 契約測試 | 只碰測試檔、不 commit |
 
 團隊 repo 那 6 個角色**只移植了 2 個**——其餘 4 個的內容是 Java/Spring/PixiJS 專屬，
 且 `devops` 那份的「never touch `main`」與本檔上面的單人開發約定直接衝突。
 
 ⚠️ **冷啟動成本**：subagent 會自己重讀本檔（28.9 KB）+ `CLAUDE.md`，
 每次約 9~10k token。**小改動、單檔修正、問問題一律主執行緒直接做**；
-只有雜訊大、要來回試錯的工作（Phase 5 的契約測試與壓測）才值得派。
+只有雜訊大、要來回試錯的工作（Phase 5 的契約測試）才值得派。
 地雷知識**只維護在本檔 §2**，不要複製進 agent 檔案（會漂移）。
 改完 agent 檔案要**重開 session** 才註冊。
 
@@ -428,20 +408,13 @@ docker compose -f deploy/docker-compose.yml --profile observability up -d
 docker compose -f deploy/docker-compose.yml --profile observability down -v
 ```
 
-**跨語言契約測試與壓測（Phase 5）**：
+**跨語言契約測試（Phase 5）**：
 
 ```bash
 # 契約測試（Node.js，同一份對兩個實作跑）。詳見 test/contract/README.md
 cd test/contract && npm ci
 CONTRACT_TARGET=go   npm test                      # 本 repo，8088
 CONTRACT_TARGET=java JWT_SECRET=<團隊那把> npm test  # 團隊 repo，8087
-
-# 壓測。⚠️ 一定要在容器網路裡跑，不要從宿主打（地雷 §2.30）
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o bin/load-linux ./test/load
-docker run --rm --network lucky-star-notify-go_default \
-  -v "$PWD/bin:/host:ro" -e JWT_SECRET=... alpine:3.22 \
-  /host/load-linux -target ws://notify-go:8088/ws -kafka kafka:9092 \
-  -conns 1000 -rounds 10 -hold 40s
 ```
 
 **看服務有沒有真的在消費**：`notify_kafka_messages_total` 是 CounterVec，

@@ -74,7 +74,7 @@ WebSocket/STOMP 把訊息即時推給線上玩家**。
 - 第一層：Go 單元測試，全部跑 `go test -race`
 - 第二層：**跨語言黑箱契約測試**（Node + `@stomp/stompjs`），同一份測試對
   Java 版（8087）與 Go 版（8088）都要綠
-- 第三層：效能對照，**數字一律實測，不可虛構**
+- 第三層：效能對照（**尚未做**；日後要寫數字，一律自己實測，不可虛構）
 
 而且切換只需要改團隊 repo gateway 的一個環境變數
 （`NOTIFICATION_SERVICE_URL`），因為 `/ws` 已在 `jwt.whitelist` 裡。
@@ -86,7 +86,7 @@ WebSocket/STOMP 把訊息即時推給線上玩家**。
 ### 正面
 
 - 協議層實作、併發模型、跨語言等價驗證，三個履歷賣點
-- 單一靜態 binary、預期 < 20 MB 映像、亞秒啟動（Phase 4 實測）
+- 單一靜態 binary、映像 < 20 MB（CI 有大小上限斷言）
 - `go test -race` 是 Java 沒有等價物的工具，值得在 README 標出來
 
 ### 負面 / 已接受的成本

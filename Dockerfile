@@ -7,7 +7,7 @@
 # 第一階段有完整的 Go 工具鏈（幾百 MB），第二階段只拿走那一個編譯好的
 # 執行檔。最終映像裡**沒有編譯器、沒有原始碼、沒有套件快取**——這既是
 # 體積的來源，也是攻擊面的來源。對比 Java 版：那邊的 runtime 至少要一個
-# JRE（`eclipse-temurin:21-jre-alpine` 約 180 MB），因為 jar 不能自己跑。
+# JRE（`eclipse-temurin:21-jre-alpine`），因為 jar 不能自己跑。
 # Go 的執行檔可以，所以連 base image 都幾乎不需要。
 #
 # # 為什麼一個 Dockerfile 蓋兩個程式
@@ -16,7 +16,7 @@
 # 建置步驟一模一樣，只差要編哪個套件。用 ARG 帶進來就好，複製一份
 # Dockerfile 只會讓兩邊之後各自腐爛。
 # 預設值是 notify，所以 `docker build .` 蓋出來的就是正式服務的映像——
-# README 裡宣稱的體積指的是這一個。
+# CI 的映像大小上限斷言檢查的就是這一個。
 
 # ── 建置階段 ────────────────────────────────────────────────────────────
 # 版本釘死到 patch：base image 換版是「會改變產出」的事件，應該是一次
@@ -69,10 +69,9 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
 #
 # # 為什麼不是 distroless
 #
-# 計畫書 §4.6 原本寫 gcr.io/distroless/static-debian12。實測下來那樣是
-# **23.7 MB**，超過 DoD 的 20 MB。拆開看，多出來的幾乎全是我們用不到的東西：
-# tzdata 4.24 MB、base-files 0.58 MB、media-types 0.15 MB…
-# 本服務不做任何時區換算（時間戳原樣搬運，容器一律 UTC），付那 4 MB 沒有回報。
+# 計畫書 §4.6 原本寫 gcr.io/distroless/static-debian12。但它多帶了不少我們用不到的東西
+# （DoD 要求映像 < 20 MB，CI 有斷言）：tzdata、base-files、media-types…
+# 本服務不做任何時區換算（時間戳原樣搬運，容器一律 UTC），付那份體積沒有回報。
 #
 # 改成 scratch 之後要**自己補回**三樣 distroless 免費提供的東西，
 # 少任何一樣都會出現難查的症狀：

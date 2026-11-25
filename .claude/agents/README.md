@@ -13,7 +13,7 @@
 | 角色 | 職責 | 關鍵限制 |
 |---|---|---|
 | `go-reviewer` | 審查 diff／檔案，對照 AGENTS.md §2 的 28 條地雷 | **唯讀**（白名單沒有 Edit/Write——審查者不能是作者） |
-| `go-tester` | 寫並跑測試：Go 單元測試、`test/contract/` 契約測試、`test/load/` 壓測 | 只碰測試檔；發現產品 bug 只回報不修；不 commit |
+| `go-tester` | 寫並跑測試：Go 單元測試、`test/contract/` 契約測試 | 只碰測試檔；發現產品 bug 只回報不修；不 commit |
 
 ## 為什麼團隊那邊 6 個，這裡只有 2 個
 
@@ -40,7 +40,7 @@
 |---|---|
 | 審查、幫我 review、檢查一下這段、commit 前看一下、有沒有踩到地雷、併發安全嗎 | `go-reviewer` |
 | review this diff, code review, check before commit, is this race-free | `go-reviewer` |
-| 寫測試、補測試、跑測試、契約測試、跨語言等價、壓測、效能對照、測試沒過 | `go-tester` |
+| 寫測試、補測試、跑測試、契約測試、跨語言等價、測試沒過 | `go-tester` |
 | write tests, run the suite, contract test, load test, benchmark, equivalence test | `go-tester` |
 
 也可以手動指定：「用 go-reviewer 審查 `internal/hub` 最近的 diff」。

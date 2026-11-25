@@ -1,7 +1,7 @@
 {
   "uid": "lucky-notify-go",
   "title": "Lucky Star Notify (Go)",
-  "description": "推播服務的四個自訂指標，加上 Go runtime 的記憶體與 goroutine 數（Phase 5 效能對照的數據來源）。",
+  "description": "推播服務的四個自訂指標，加上 Go runtime 的記憶體與 goroutine 數。",
   "tags": ["lucky-star", "go", "websocket"],
   "timezone": "browser",
   "schemaVersion": 39,

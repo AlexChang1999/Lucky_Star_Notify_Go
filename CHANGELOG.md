@@ -5,9 +5,9 @@
 
 ---
 
-## [feat] — 2026-07-31 — Phase 5：跨語言契約測試、效能對照與作品集 README
+## [feat] — 2026-07-31 — Phase 5：跨語言契約測試與作品集 README
 
-Phase 5 的三項 DoD 全部完成，專案六個 Phase 到此收尾。
+Phase 5 的契約測試、ADR 與 README 完成。
 
 **Added**
 - **`test/contract/`——跨語言黑箱契約測試**。Node.js + `@stomp/stompjs` +
@@ -19,56 +19,39 @@ Phase 5 的三項 DoD 全部完成，專案六個 Phase 到此收尾。
   `playerId` 且 `type` 在第一個、`null` 欄位是「存在且為 null」而不是消失、
   MESSAGE 帧必帶 `subscription` 與 `message-id`、JSON 不做 HTML 轉義、
   以及 `alg: none` 等五種爛憑證都要回 ERROR 並斷線。
-- **`test/load/`——Go 壓測 client**。N 條長連線 + R 輪廣播，量握手延遲與
-  扇出延遲（最近排名法，不插值也不印平均值）。同一支程式壓兩邊。
-- **`docs/效能對照報告.md`**。全部實測，含一整節「這份報告**沒有**證明的事」。
 - **CI 多一步：契約測試（Go 版）** 進 `compose 煙霧測試` job。
   Java 版那一組進不了 CI（需要團隊 repo 的原始碼），但把 Go 這一側釘住，
   等價性至少不會**無聲**失效。
 - demo 的 Kafka 多開一個 `HOST` listener（宿主 **9094**，與團隊的 9092 錯開），
-  契約測試與壓測才能從宿主發事件。
+  契約測試才能從宿主發事件。
 
 **Fixed**
 - **`cmd/demo` 每一則事件都被 producer 端壓了整整一秒才送出**。
   `kafka-go` 的 `Writer.BatchTimeout` 預設是 1 秒、`BatchSize` 預設 100，
   而這個產生器一次只寫一則。demo 頁上的「即時推播」因此無端慢一秒，
   **日誌與指標都看不出來**——`notify_push_latency_seconds` 量的是 Kafka
-  訊息時間戳之後的事，那一秒發生在它之前。設 `BatchSize: 1` 修掉。
-  是做扇出延遲量測時才發現的（地雷 §2.29）。
-- 壓測的失敗統計用完整錯誤字串當 map 的 key，而 net 錯誤裡帶著**本地埠號**，
-  於是 3000 條失敗印出 3000 行「各一種」。改成拆掉位址後再分類，並依數量排序
-  （map 走訪順序是隨機的，不排序會讓同一場壓測兩次跑出不同順序的輸出）。
+  訊息時間戳之後的事，那一秒發生在它之前。設 `BatchSize: 1` 修掉（地雷 §2.29）。
 
 **Changed**
 - README 依計畫書 §12 的順序重寫成作品集門面。**沒有做 demo GIF**——
   `docker compose up` 一行指令比一張 GIF 更能證明東西真的跑得起來。
-- `AGENTS.md` 新增地雷 §2.29~§2.32，並補上 `GOMEMLIMIT` 的**容量抓法**。
+- `AGENTS.md` 新增地雷 §2.29~§2.32。
 
 **為什麼**
 「我用 Go 重寫了一個服務」這句話本身沒有說服力，因為無法查證。
-Phase 5 做的全部是**把主張換成證據**：等價性換成一份兩邊都跑得過的測試，
-效能換成可重現的實測，而且**連 Go 沒有贏的那一項都照實寫進去**
-（記憶體充足時扇出 p50 只差 1.15×，Go 並沒有快一個數量級）。
-挑贏的講會讓整份報告失去可信度。
+Phase 5 做的是**把主張換成證據**：等價性換成一份兩邊都跑得過的測試。
 
 **如何驗證**
 - 契約測試：Go 版 **14/14**、Java 版 **14/14**，而且 Java 版是**第一次跑就過**，
   沒有為了配合它改過任何斷言
-- 效能對照（實測，co-located，詳見報告）：映像 27× 小、冷啟動 16× 快
-  （301ms vs 4791ms）、閒置記憶體 28× 少（7.6MiB vs 218MiB）、
-  5000 連線握手 p99 89× 好（12.7ms vs 1131ms）；扇出 p50 只差 1.15×
 - `gofmt -l` 無輸出、`go vet`、`golangci-lint`（0 issues）、`go test -race ./...` 全綠
 
 **踩到並記進 AGENTS.md 的四個新雷**
 1. §2.29 `kafka-go` 的 `BatchTimeout` 預設 1 秒（上面那個 demo bug 的成因）
-2. §2.30 **Docker Desktop 上壓測不能從宿主打**：5000 條有 3011 條被 reset，
-   連壓測程式對 Kafka 的連線也一起——是宿主埠轉發層，不是服務。
-   改成網內施壓後全通，而且握手 p50 從 8.35ms 變 0.86ms（原本量的是轉發層）
+2. §2.30 Docker Desktop 上大量連線的壓測不要從宿主打：宿主埠轉發層可能成為瓶頸
 3. §2.31 `docker rm -f` 殺 consumer 會留幽靈 member（§2.4 的變形），
-   下一個容器可能分不到 partition。量 Java 記憶體下限時真的踩到，
-   差點把「256m 下收不到訊息」當成 Java 的缺陷寫進報告
-4. §2.32 `GOMEMLIMIT` 是**軟上限**：貼上去不會死，會變慢（5000 條 @128MB
-   零丟包但扇出 p95 從 44.8ms 惡化到 552ms）。也就是現在的 128M 只夠約 1000 條
+   下一個容器可能分不到 partition
+4. §2.32 `GOMEMLIMIT` 是**軟上限**：貼上去不會 OOM，但 GC 會更積極、延遲變差
 
 ---
 
@@ -206,13 +189,13 @@ CI 在 PR #2 上第一次執行。`建置映像` 過（含映像大小斷言）�
 - `cmd/demo` 啟動時**先把三個 topic 建好**（`ensureTopics`，best-effort，
   失敗只記 WARN）。原本靠 `AllowAutoTopicCreation`，走的是
   「第一次寫入失敗 → 退避 2 秒 → 再試」的路徑。
-  **實測冷啟動到第一則被消費：約 30 秒 → 2.3 秒**，
+  冷啟動後第一則被消費的等待時間因此縮短，
   順便消掉啟動時那行看起來很像壞掉的 `寫入 Kafka 失敗` WARN。
 
 **如何驗證**
 - `go test -race -count=5 -run TestSlowClient... ./internal/hub/` 全過；
   再用 `-cpu=1 -count=3` 跑整個 hub 套件（模擬 CI 的低核心環境）也全過
-- `docker compose down -v` 後重新 up，輪詢實測**第一則被消費 2.3 秒**
+- `docker compose down -v` 後重新 up，輪詢確認第一則訊息有被消費
 - `gofmt -l` 無輸出、`go vet`、`golangci-lint`（0 issues）、
   `go test -race ./...` 全綠
 
@@ -252,9 +235,8 @@ CI 在 PR #2 上第一次執行。`建置映像` 過（含映像大小斷言）�
 - Prometheus/Grafana 用 9091/3001 而不是 9090/3000
 
 **為什麼**
-- **base image 改 scratch**：distroless 實測 **23.7 MB**，超過 DoD 的 20 MB。
-  多出來的 5.1 MB 幾乎全是用不到的東西（tzdata 4.24 MB + base-files +
-  media-types + netbase），而本服務不做任何時區換算。改 scratch 後 **18.6 MB**。
+- **base image 改 scratch**：distroless 帶了不少用不到的東西（tzdata、base-files、
+  media-types、netbase），不利於 DoD 的 20 MB 上限，而本服務不做任何時區換算。
   代價是要自己補回 CA 憑證與**數字 UID**（沒有 /etc/passwd 就不能寫
   `USER nonroot`，寫了容器直接起不來）。
 - **demo 頁與 token 端點放在獨立容器**：demo 需要發 JWT 才能連上，
@@ -280,15 +262,12 @@ CI 在 PR #2 上第一次執行。`建置映像` 過（含映像大小斷言）�
 **如何驗證**（2026-07-30，在**第二台**沒有團隊 repo 的機器上實測）
 - `gofmt -l` 無輸出、`go vet ./...` 無輸出、`golangci-lint run` 0 issues、
   `go build ./...` 通過、`go test -race ./...` 全綠（新增 cmd/demo）
-- `docker compose up --build -d --wait` → **39.8 秒**全部 healthy
-  （絕大部分在等 Kafka；notify-go 自己從容器啟動到就緒是 **230 ms**）
+- `docker compose up --build -d --wait` → 全部 healthy
 - **端到端**：另寫一支 STOMP over WebSocket client 走完整條路徑
   （取 token → 握手 → 訂閱 → 收訊息），三條推播路徑
   （`/user/queue/notifications`、`/topic/notifications`、`/topic/rank`）
   都收得到，且 `subscription` 與 `message-id` header 都在
-- 映像 **18.6 MB**（`docker images`）／5.29 MB（pull 下載量）；
-  閒置記憶體 **12.9 MiB** / 128 MiB 上限；p95 推播延遲 **4.75 ms**
-- 優雅關閉四輪：牆鐘 **6.5~8.7 秒**，`ExitCode=0`，三個 consumer 都乾淨收工
+- 優雅關閉：`ExitCode=0`，三個 consumer 都乾淨收工
 - Grafana 的資料來源與 dashboard 自動載入，**dashboard 的 7 條 PromQL
   逐條對 Prometheus 查過都有資料**（避免指標名稱打錯卻沒人發現）
 - CI 在 PR #2 上實跑，**三個 job 全綠**（第一次是紅的，抓到兩個本機不會
@@ -482,8 +461,6 @@ CI 在 PR #2 上第一次執行。`建置映像` 過（含映像大小斷言）�
   - `PORT=notaport` → exit 1，`PORT="notaport" 不是整數`
   - `GET /actuator/health` → 200 `{"status":"UP"}`；`POST` 同路徑 → **405**（Go 1.22 方法路由）
   - `GET /metrics` 與 `GET /actuator/prometheus` → 皆 200，含 `notify_ws_connections`
-  - 閒置 RSS `process_resident_memory_bytes` ≈ **11.5 MB**、`go_goroutines` = 9、binary 15.8 MB
-    （Windows 原生、非容器，**只是早期參考值，不可寫進效能對照報告**——那份要用容器實測）
 
 **已知未完成**（Phase 2 處理）
 - `SUBSCRIBE` / `UNSUBSCRIBE` 尚未處理，握手後收到的帧會被讀掉丟棄
